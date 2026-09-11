@@ -221,21 +221,84 @@ export function segmentList(design) {
   return segs;
 }
 
-// 重合路径汇成线束段
+// 重合路径汇成线束段：共线分组 + 投影拆分。
+// 部分重合的共线路径（如 0–100 与 50–150）被拆成原子段，
+// 重合区 50–100 成为含全部覆盖导线的束段，而非两段单线。
 export function computeBundles(design) {
-  const map = new Map();
-  for (const s of segmentList(design)) {
-    const k = segmentKey(s.a, s.b);
-    let b = map.get(k);
-    if (!b) {
-      b = { key: k, a: s.a, b: s.b, wires: [], length: dist(s.a, s.b) };
-      map.set(k, b);
-    }
-    if (!b.wires.includes(s.wire)) b.wires.push(s.wire);
+  const segs = segmentList(design);
+  // 1) 按所在直线分组（方向平行且法向偏移 < 0.5mm 视为共线）
+  const groups = [];
+  for (const s of segs) {
+    const L = dist(s.a, s.b);
+    if (L < 0.01) continue;
+    let ux = (s.b.x - s.a.x) / L, uy = (s.b.y - s.a.y) / L;
+    if (ux < 0 || (ux === 0 && uy < 0)) { ux = -ux; uy = -uy; } // 方向规范化
+    const nx = -uy, ny = ux;
+    const c = nx * s.a.x + ny * s.a.y;
+    let g = groups.find(g =>
+      Math.abs(ux * g.u.x + uy * g.u.y) > 1 - 1e-6 &&
+      Math.abs(c - g.c) < 0.5
+    );
+    if (!g) { g = { u: { x: ux, y: uy }, n: { x: nx, y: ny }, c, segs: [] }; groups.push(g); }
+    g.segs.push(s);
   }
-  const list = [...map.values()];
-  for (const b of list) b.diameter = bundleDiameter(design, b.wires);
-  return list;
+  // 2) 组内投影到直线方向，按所有端点切分为原子区间
+  const out = [];
+  for (const g of groups) {
+    const ox = g.n.x * g.c, oy = g.n.y * g.c; // 直线上参考点
+    const iv = [];
+    const cuts = new Set();
+    for (const s of g.segs) {
+      let s0 = g.u.x * (s.a.x - ox) + g.u.y * (s.a.y - oy);
+      let s1 = g.u.x * (s.b.x - ox) + g.u.y * (s.b.y - oy);
+      if (s0 > s1) { const t = s0; s0 = s1; s1 = t; }
+      iv.push({ s0, s1, wire: s.wire });
+      cuts.add(Math.round(s0 * 2) / 2);
+      cuts.add(Math.round(s1 * 2) / 2);
+    }
+    const pts = [...cuts].sort((a, b) => a - b);
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1], p1 = pts[i];
+      if (p1 - p0 < 0.01) continue;
+      const mid = (p0 + p1) / 2;
+      const wires = [];
+      for (const s of iv) {
+        if (s.s0 <= mid + 1e-9 && s.s1 >= mid - 1e-9 && !wires.includes(s.wire)) wires.push(s.wire);
+      }
+      if (!wires.length) continue;
+      out.push({
+        a: { x: ox + g.u.x * p0, y: oy + g.u.y * p0 },
+        b: { x: ox + g.u.x * p1, y: oy + g.u.y * p1 },
+        wires, length: p1 - p0,
+        diameter: bundleDiameter(design, wires),
+      });
+    }
+  }
+  return out;
+}
+
+// 查询某段路径上经过的最大束径（用于弯曲半径核算）
+export function segBundleDiameter(bundles, a, b) {
+  const L = dist(a, b);
+  if (L < 0.01) return 0;
+  let ux = (b.x - a.x) / L, uy = (b.y - a.y) / L;
+  if (ux < 0 || (ux === 0 && uy < 0)) { ux = -ux; uy = -uy; }
+  const nx = -uy, ny = ux;
+  const c = nx * a.x + ny * a.y;
+  let best = 0;
+  for (const bd of bundles) {
+    const L2 = dist(bd.a, bd.b);
+    if (L2 < 0.01) continue;
+    let vx = (bd.b.x - bd.a.x) / L2, vy = (bd.b.y - bd.a.y) / L2;
+    if (vx < 0 || (vx === 0 && vy < 0)) { vx = -vx; vy = -vy; }
+    if (Math.abs(ux * vx + uy * vy) < 1 - 1e-6) continue;      // 不平行
+    if (Math.abs(nx * bd.a.x + ny * bd.a.y - c) >= 0.5) continue; // 不共线
+    const t0 = ux * (bd.a.x - a.x) + uy * (bd.a.y - a.y);
+    const t1 = ux * (bd.b.x - a.x) + uy * (bd.b.y - a.y);
+    const lo = Math.max(0, Math.min(t0, t1)), hi = Math.min(L, Math.max(t0, t1));
+    if (hi - lo > 0.01 && bd.diameter > best) best = bd.diameter;
+  }
+  return best;
 }
 
 // 按线径估算束径: D = 填充系数 × √(Σ dᵢ²)
@@ -254,7 +317,6 @@ export function validate(design) {
   const issues = [];
   const s = design.settings;
   const bundles = computeBundles(design);
-  const segD = new Map(bundles.map(b => [b.key, b.diameter]));
 
   // 端子重复占用
   const occ = new Map();
@@ -335,26 +397,43 @@ export function validate(design) {
       }
     }
 
-    // 弯曲半径不足（按经过该拐点的束径）
-    for (let i = 1; i < pts.length - 1; i++) {
+    // 弯曲半径不足（按经过该拐点的束径）。
+    // 拐角 i 所需切线长 tᵢ = r_req / tan(θ/2)；相邻两拐角共用一段时须满足 tᵢ + tᵢ₊₁ ≤ L，
+    // 端点一侧不消耗退距。可容纳半径 r = 可用退距 × tan(θ/2)。
+    const n = pts.length;
+    const defl = new Array(n).fill(0);
+    const tReq = new Array(n).fill(0);
+    const rReq = new Array(n).fill(0);
+    const dAt = new Array(n).fill(0);
+    for (let i = 1; i < n - 1; i++) {
       const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1];
       const L1 = dist(p0, p1), L2 = dist(p1, p2);
       if (L1 < 0.5 || L2 < 0.5) continue;
       const v1 = { x: (p0.x - p1.x) / L1, y: (p0.y - p1.y) / L1 };
       const v2 = { x: (p2.x - p1.x) / L2, y: (p2.y - p1.y) / L2 };
       const dot = Math.max(-1, Math.min(1, v1.x * v2.x + v1.y * v2.y));
-      const defl = Math.PI - Math.acos(dot); // 偏转角，0=笔直
-      if (defl < 0.087) continue; // <5° 忽略
-      const rMax = 0.5 * Math.min(L1, L2) * Math.tan(defl / 2);
+      defl[i] = Math.PI - Math.acos(dot); // 偏转角，0=笔直
+      if (defl[i] < 0.087) continue; // <5° 忽略
       const D = Math.max(
-        segD.get(segmentKey(p0, p1)) || 0,
-        segD.get(segmentKey(p1, p2)) || 0
+        segBundleDiameter(bundles, p0, p1),
+        segBundleDiameter(bundles, p1, p2),
+        (design.settings.packFactor || 1.2) * w.gauge
       );
-      const rReq = s.bendFactor * D;
-      if (rMax < rReq) {
+      dAt[i] = D;
+      rReq[i] = s.bendFactor * D;
+      tReq[i] = rReq[i] / Math.tan(defl[i] / 2);
+    }
+    for (let i = 1; i < n - 1; i++) {
+      if (defl[i] < 0.087) continue;
+      const avail = Math.min(
+        dist(pts[i - 1], pts[i]) - tReq[i - 1],
+        dist(pts[i], pts[i + 1]) - tReq[i + 1]
+      );
+      if (tReq[i] > avail + 0.01) {
+        const rMax = Math.max(0, avail) * Math.tan(defl[i] / 2);
         issues.push({
           level: 'warn', kind: 'bend', wire: w.id,
-          msg: `${w.label} 第${i}个拐点弯曲半径不足：可达成 ≈${rMax.toFixed(1)}mm < 要求 ${rReq.toFixed(1)}mm（束径⌀${D.toFixed(1)}）`,
+          msg: `${w.label} 第${i}个拐点弯曲半径不足：可达成 ≈${rMax.toFixed(1)}mm < 要求 ${rReq[i].toFixed(1)}mm（束径⌀${dAt[i].toFixed(1)}）`,
         });
       }
     }
@@ -435,7 +514,9 @@ export function materialSummary(design) {
 // ---------- 绑扎位置 ----------
 
 function ptDesc(design, p) {
-  return p.node ? nodeName(design, p.node) : `(${p.x.toFixed(0)},${p.y.toFixed(0)})`;
+  if (p.node) return nodeName(design, p.node);
+  const n = design.nodes.find(nd => dist(nd, p) < 0.6);
+  return n ? n.name : `(${p.x.toFixed(0)},${p.y.toFixed(0)})`;
 }
 
 // 节点引出的线臂（方向 + 邻点）

@@ -106,5 +106,52 @@ M.tidyDesign(d9);
 ok(w9.path.length === n0 - 1, '未锁定导线共线点被移除');
 ok(w9b.path.length === n0b, '锁定导线不被整理');
 
+console.log('== 共线拆分汇束 ==');
+{
+  // 两条水平路径 0–100 与 50–150：重合区 50–100 必须汇成 2 根导线的束段
+  const dd = M.createDesign('t');
+  const J1 = M.makeNode('connector', 0, 0, 'J1', 2);
+  const J2 = M.makeNode('connector', 100, 0, 'J2', 2);
+  const J3 = M.makeNode('connector', 50, 0, 'J3', 2);
+  const J4 = M.makeNode('connector', 150, 0, 'J4', 2);
+  dd.nodes.push(J1, J2, J3, J4);
+  const w1 = M.makeWire(dd, J1.id, 1);
+  w1.to = { node: J2.id, pin: 1 };
+  w1.path = [{ x: 0, y: 0, node: J1.id }, { x: 100, y: 0, node: J2.id }];
+  const w2 = M.makeWire(dd, J3.id, 1);
+  w2.to = { node: J4.id, pin: 1 };
+  w2.path = [{ x: 50, y: 0, node: J3.id }, { x: 150, y: 0, node: J4.id }];
+  dd.wires.push(w1, w2);
+  const bs = M.computeBundles(dd);
+  const shared = bs.filter(b => b.wires.length === 2);
+  ok(shared.length === 1, `重合区汇成 1 段束段（实际 ${shared.length}）`);
+  ok(shared.length === 1 && near(shared[0].a.x, 50) && near(shared[0].b.x, 100), '重合区为 50–100mm');
+  ok(shared.length === 1 && near(shared[0].length, 50), '重合束段长 50mm');
+  const singles = bs.filter(b => b.wires.length === 1);
+  ok(singles.length === 2 && near(singles.reduce((s, b) => s + b.length, 0), 100), '两侧各为单线段（0–50、100–150）');
+}
+
+console.log('== 弯曲半径（退距约束） ==');
+{
+  // 90° 拐点、两侧各 6mm 退距：可容纳 r = 6·tan45° = 6.0mm ≥ 要求 3.6mm → 不应报警
+  const mk = (L1, L2) => {
+    const dd = M.createDesign('t');
+    const A = M.makeNode('connector', 0, 0, 'J1', 1);
+    const B = M.makeNode('connector', L1, L2, 'J2', 1);
+    dd.nodes.push(A, B);
+    const w = M.makeWire(dd, A.id, 1);
+    w.gauge = 1.0; // D = 1.2×1.0 = 1.2 → r_req = 3×1.2 = 3.6mm
+    w.to = { node: B.id, pin: 1 };
+    w.path = [{ x: 0, y: 0, node: A.id }, { x: L1, y: 0 }, { x: L1, y: L2, node: B.id }];
+    dd.wires.push(w);
+    return dd;
+  };
+  ok(!M.validate(mk(6, 6)).some(i => i.kind === 'bend'), '6mm 退距 90° 拐点可容纳 6.0mm ≥ 3.6mm，不报警');
+  const bad = M.validate(mk(3, 3));
+  ok(bad.some(i => i.kind === 'bend'), '3mm 退距 < 所需 3.6mm，报警');
+  const msg = (bad.find(i => i.kind === 'bend') || {}).msg || '';
+  ok(msg.includes('3.0') && msg.includes('3.6'), '报警含可达成/要求半径：' + msg);
+}
+
 console.log(`\n结果：${pass} 通过，${fail} 失败`);
 process.exit(fail ? 1 : 0);

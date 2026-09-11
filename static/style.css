@@ -1,0 +1,138 @@
+/* style.css — 线束钉板放样与装配推演台 */
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 13px/1.5 "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  color: #222; background: #eceff1; display: flex; flex-direction: column;
+}
+.hidden { display: none !important; }
+button {
+  font: inherit; padding: 3px 10px; border: 1px solid #b6bec5; border-radius: 4px;
+  background: #fff; cursor: pointer;
+}
+button:hover { background: #eef4fb; border-color: #7fa8d9; }
+button:disabled { opacity: .45; cursor: default; }
+input, select, textarea { font: inherit; padding: 2px 5px; border: 1px solid #b6bec5; border-radius: 3px; }
+input[type=number] { width: 64px; }
+code { background: #f0f0f0; padding: 0 3px; border-radius: 3px; }
+
+/* ---------- 顶栏 ---------- */
+#topbar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 6px 10px; background: #263238; color: #eceff1;
+}
+#topbar .brand { font-weight: 700; margin-right: 6px; }
+.tb-group { display: inline-flex; align-items: center; gap: 4px; }
+.tb-group + .tb-group { border-left: 1px solid #455a64; padding-left: 14px; }
+#topbar button { background: #37474f; color: #eceff1; border-color: #546e7a; }
+#topbar button:hover { background: #455a64; }
+#topbar button.tool.active { background: #1565c0; border-color: #64b5f6; }
+#topbar .zoom { min-width: 44px; text-align: center; display: inline-block; }
+#topbar .chk { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+
+/* ---------- 主区 ---------- */
+#main { flex: 1; display: flex; min-height: 0; }
+#canvasWrap { flex: 1; position: relative; overflow: hidden; background: #cfd8dc; }
+#canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+#canvas.wiretool { cursor: crosshair; }
+
+/* 端子选择弹窗 */
+#pinPicker {
+  position: absolute; z-index: 20; background: #fff; border: 1px solid #78909c;
+  border-radius: 6px; box-shadow: 0 4px 16px #0004; padding: 8px; max-width: 240px;
+}
+#pinPicker h5 { margin: 0 0 6px; font-size: 12px; color: #37474f; }
+#pinPicker .pins { display: flex; flex-wrap: wrap; gap: 4px; }
+#pinPicker .pins button { min-width: 34px; }
+#pinPicker .pins button.occ { text-decoration: line-through; color: #b71c1c; }
+#pinPicker .cancel { margin-top: 6px; width: 100%; }
+
+/* 逐步推演条 */
+#stepBar {
+  position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 20;
+  background: #fffde7; border: 1px solid #f9a825; border-radius: 8px;
+  box-shadow: 0 4px 16px #0003; padding: 8px 14px; display: flex; align-items: center; gap: 10px;
+  max-width: 90%;
+}
+#stepBar .cur { font-weight: 700; }
+#stepBar .prog { color: #666; }
+
+/* ---------- 侧栏 ---------- */
+#side {
+  width: 380px; background: #fafbfc; border-left: 1px solid #b0bec5;
+  display: flex; flex-direction: column; min-height: 0;
+}
+#tabs { display: flex; border-bottom: 1px solid #b0bec5; }
+#tabs .tab {
+  flex: 1; border: none; border-radius: 0; background: #eceff1; padding: 7px 0;
+  border-bottom: 2px solid transparent;
+}
+#tabs .tab.active { background: #fff; border-bottom-color: #1565c0; font-weight: 700; }
+.badge {
+  display: inline-block; min-width: 16px; padding: 0 4px; border-radius: 8px;
+  background: #c62828; color: #fff; font-size: 11px; line-height: 16px;
+}
+.panel { flex: 1; overflow: auto; padding: 10px; }
+.panel h4 { margin: 12px 0 6px; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+.panel h4:first-child { margin-top: 0; }
+.panel .hint { color: #777; font-size: 12px; margin: 4px 0; }
+.row { margin: 6px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.row label { display: inline-flex; align-items: center; gap: 4px; }
+.row.btns button { flex: 0 0 auto; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; }
+.grid2 label { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+legend, .sub { font-weight: 700; color: #37474f; margin-top: 8px; }
+
+/* 属性面板 */
+.swatch { display: inline-flex; gap: 3px; flex-wrap: wrap; }
+.swatch button { width: 20px; height: 20px; padding: 0; border-radius: 3px; }
+.swatch button.cur { outline: 2px solid #1565c0; }
+.leninfo { background: #e3f2fd; border-radius: 4px; padding: 4px 8px; margin: 6px 0; }
+
+/* 检查面板 */
+.issue { padding: 4px 6px; border-radius: 4px; margin: 3px 0; cursor: pointer; font-size: 12px; }
+.issue:hover { filter: brightness(.96); }
+.issue.error { background: #ffebee; border-left: 3px solid #c62828; }
+.issue.warn { background: #fff8e1; border-left: 3px solid #f9a825; }
+.issue.info { background: #e3f2fd; border-left: 3px solid #1565c0; }
+.okline { color: #2e7d32; padding: 6px; }
+
+/* 表格 */
+table.list { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.list th, table.list td { border: 1px solid #cfd8dc; padding: 2px 5px; text-align: right; white-space: nowrap; }
+table.list th { background: #eceff1; position: sticky; top: 0; }
+table.list td.l, table.list th.l { text-align: left; }
+table.list tr:hover td { background: #f5f5f5; }
+table.list tr.cur td { background: #bbdefb; }
+.colorchip { display: inline-block; width: 10px; height: 10px; border: 1px solid #0006; border-radius: 2px; vertical-align: -1px; }
+
+/* 装配 */
+.asmitem { display: flex; gap: 8px; align-items: center; padding: 3px 6px; border-radius: 4px; cursor: pointer; }
+.asmitem:hover { background: #eef4fb; }
+.asmitem.done { color: #2e7d32; }
+.asmitem.cur { background: #fff8e1; font-weight: 700; }
+.asmitem .no { width: 22px; text-align: right; color: #777; }
+
+/* 数据面板 */
+.savelist .sv { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-bottom: 1px solid #eee; }
+.savelist .sv .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.savelist .sv .tm { color: #999; font-size: 11px; }
+#netlist { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+#designName { width: 220px; }
+
+/* ---------- 状态栏 ---------- */
+#statusbar {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 3px 10px; background: #263238; color: #b0bec5; font-size: 12px;
+}
+
+/* ---------- 画布内 ---------- */
+.halo { paint-order: stroke; stroke: #fdfdf8; stroke-width: .9; }
+.wire-current polyline.colored {
+  stroke-dasharray: 7 3;
+  animation: march .8s linear infinite;
+}
+@keyframes march { to { stroke-dashoffset: -10; } }
+.pulse { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+.vhandle:hover { fill: #ffe9a8; }

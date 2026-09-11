@@ -125,7 +125,7 @@ function renderWires(ctx) {
     h += `<g data-wire="${w.id}" opacity="${opacity}" class="wiregrp ${cls}">`;
     if (sel) h += `<polyline points="${ptsAttr(pts)}" fill="none" stroke="#2f7df6" stroke-width="${width + 3}" stroke-opacity="0.35" stroke-linejoin="round" stroke-linecap="round"/>`;
     h += `<polyline points="${ptsAttr(pts)}" fill="none" stroke="#333" stroke-width="${width + 0.7}" stroke-linejoin="round" stroke-linecap="round" style="pointer-events:none"/>`;
-    h += `<polyline points="${ptsAttr(pts)}" fill="none" stroke="${w.color}" stroke-width="${width}" stroke-linejoin="round" stroke-linecap="round" style="cursor:pointer"/>`;
+    h += `<polyline class="colored" points="${ptsAttr(pts)}" fill="none" stroke="${w.color}" stroke-width="${width}" stroke-linejoin="round" stroke-linecap="round" style="cursor:pointer"/>`;
     // 端点
     for (const p of [pts[0], pts[pts.length - 1]]) {
       h += `<circle cx="${p.x}" cy="${p.y}" r="1.8" fill="${w.color}" stroke="#333" stroke-width="0.4" style="pointer-events:none"/>`;
@@ -217,6 +217,11 @@ function renderOverlay(ctx) {
           fill="${bound ? '#ffd166' : '#fff'}" stroke="#2f7df6" stroke-width="${1 / z}" style="cursor:grab"/>`;
       });
     }
+  }
+  // 禁布区拖拽预览
+  if (ctx.preview) {
+    const r = ctx.preview;
+    h += `<rect x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}" fill="#f8d7da88" stroke="#c62828" stroke-width="${1 / z}" stroke-dasharray="${4 / z},${2 / z}" style="pointer-events:none"/>`;
   }
   // 布线预览
   if (ctx.drawing && ctx.drawing.pts.length) {

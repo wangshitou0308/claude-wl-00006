@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>线束钉板放样与装配推演台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <span class="brand">🧵 线束钉板推演台</span>
+  <span class="tb-group" id="tools">
+    <button data-tool="select" class="tool active" title="选择/移动 (V)">选择</button>
+    <button data-tool="connector" class="tool" title="放置连接器 (J)">连接器</button>
+    <button data-tool="branch" class="tool" title="放置分支点 (B)">分支点</button>
+    <button data-tool="nail" class="tool" title="放置固定钉 (N)">固定钉</button>
+    <button data-tool="zone" class="tool" title="拖出禁布区 (Z)">禁布区</button>
+    <button data-tool="wire" class="tool" title="布线：点连接器起点→途经点→连接器终点 (W)">布线</button>
+  </span>
+  <span class="tb-group">
+    <button id="zoomOut" title="缩小">−</button>
+    <span id="zoomLabel" class="zoom">100%</span>
+    <button id="zoomIn" title="放大">＋</button>
+    <button id="zoomFit" title="复位视图">复位</button>
+  </span>
+  <span class="tb-group">
+    <button id="undoBtn" title="撤销 (Ctrl+Z)">↶ 撤销</button>
+    <button id="redoBtn" title="重做 (Ctrl+Y)">↷ 重做</button>
+  </span>
+  <span class="tb-group">
+    <label class="chk"><input type="checkbox" id="optSnap" checked> 吸附</label>
+    <label class="chk"><input type="checkbox" id="optBundles" checked> 束段标注</label>
+    <label class="chk"><input type="checkbox" id="optTies"> 绑扎点</label>
+    <label class="chk"><input type="checkbox" id="optLabels" checked> 线号</label>
+  </span>
+</header>
+
+<div id="main">
+  <div id="canvasWrap">
+    <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="6" height="6" fill="#fbe4e4"></rect>
+          <line x1="0" y1="0" x2="0" y2="6" stroke="#d88" stroke-width="1"></line>
+        </pattern>
+      </defs>
+      <g id="layer-board"></g>
+      <g id="layer-zone"></g>
+      <g id="layer-bundle"></g>
+      <g id="layer-wire"></g>
+      <g id="layer-tie"></g>
+      <g id="layer-node"></g>
+      <g id="layer-overlay"></g>
+    </svg>
+    <div id="pinPicker" class="hidden"></div>
+    <div id="stepBar" class="hidden"></div>
+  </div>
+
+  <aside id="side">
+    <nav id="tabs">
+      <button data-tab="prop" class="tab active">属性</button>
+      <button data-tab="check" class="tab">检查 <span id="checkBadge" class="badge hidden"></span></button>
+      <button data-tab="cut" class="tab">裁线</button>
+      <button data-tab="tie" class="tab">绑扎</button>
+      <button data-tab="asm" class="tab">装配</button>
+      <button data-tab="data" class="tab">数据</button>
+    </nav>
+    <section id="panel-prop" class="panel"></section>
+    <section id="panel-check" class="panel hidden"></section>
+    <section id="panel-cut" class="panel hidden"></section>
+    <section id="panel-tie" class="panel hidden"></section>
+    <section id="panel-asm" class="panel hidden"></section>
+    <section id="panel-data" class="panel hidden">
+      <div class="row">
+        <label>设计名称 <input id="designName" type="text"></label>
+      </div>
+      <div class="row btns">
+        <button id="saveBtn">保存到本地库</button>
+        <button id="newBtn">新建</button>
+        <button id="sampleBtn">载入示例</button>
+      </div>
+      <div class="row btns">
+        <button id="exportBtn">导出 JSON 备份</button>
+        <button id="importBtn">导入 JSON</button>
+        <input type="file" id="importFile" accept=".json,application/json" class="hidden">
+      </div>
+      <div class="row btns">
+        <button id="printBtn">打印模板（1:1 分页）</button>
+        <button id="labelsBtn">线号标签</button>
+      </div>
+      <h4>本地存档</h4>
+      <div id="saveList" class="savelist">（尚未保存）</div>
+      <h4>接线表（用于核对“线号接错端点”）</h4>
+      <p class="hint">每行一条：<code>线号 起点 终点</code>，端点写作 <code>J1.3</code>（连接器.针）。</p>
+      <textarea id="netlist" rows="6" spellcheck="false"></textarea>
+      <div class="row btns">
+        <button id="netsApply">应用接线表</button>
+        <button id="netsAuto">从布线生成</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<footer id="statusbar">
+  <span id="statusHint">就绪</span>
+  <span id="statusPos"></span>
+</footer>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
