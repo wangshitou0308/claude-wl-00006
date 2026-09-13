@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>电气检验批次 — 线束钉板推演台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <span class="brand">⚡ 电气检验批次</span>
+  <span class="tb-group">
+    <select id="batchSel"></select>
+    <button id="newBatchBtn">新建批次</button>
+    <button id="delBatchBtn" title="删除当前批次及其读数">删除</button>
+  </span>
+  <span id="batchStatus" class="qc-status"></span>
+  <span class="tb-group" id="statusActions"></span>
+  <span style="flex:1"></span>
+  <a class="navlink" href="/">← 返回钉板推演台</a>
+</header>
+
+<div id="qcMain">
+  <aside id="qcLeft">
+    <div id="batchMeta"></div>
+    <h4>网络覆盖</h4>
+    <div id="netList"></div>
+    <h4>推荐测点</h4>
+    <div id="recList"></div>
+  </aside>
+
+  <section id="qcCenter">
+    <div id="pausedBanner" class="hidden">⏸ 已暂停后续测量：可撤回读数或处置异常，点击顶栏「继续检测」恢复。</div>
+    <div id="emptyHint" class="hidden">
+      <p>请选择左上角的检验批次，或点击「新建批次」从已保存的钉板方案创建。</p>
+      <p class="hint">批次从方案快照取得连接器、端子与接线网络；流程：待准备 → 检测中 → 待复核 → 已归档。</p>
+    </div>
+    <div id="connViews"></div>
+    <fieldset id="entryFields">
+      <legend>读数录入 <span id="entryHint" class="hint"></span></legend>
+      <div class="row">
+        <label>扫描/速录 <input id="scanInput" type="text" placeholder="两个端点，如 J1.1 J2.1 回车"></label>
+        <span class="hint">点击连接器针位也可选定探针</span>
+      </div>
+      <div class="row">
+        <label>探针 A <select id="epA"></select></label>
+        <label>探针 B <select id="epB"></select></label>
+        <button id="swapBtn" title="交换两个探针">⇄</button>
+      </div>
+      <div class="row">
+        <label class="chk"><input type="radio" name="result" value="continuity" checked> 导通</label>
+        <label class="chk"><input type="radio" name="result" value="open"> 开路</label>
+        <label>阻值 <input id="ohms" type="number" min="0" step="0.001" placeholder="可空"></label>
+        <select id="unit">
+          <option value="">（无单位）</option>
+          <option>mΩ</option>
+          <option selected>Ω</option>
+          <option>kΩ</option>
+          <option>MΩ</option>
+        </select>
+        <label>极性 <select id="polarity">
+          <option value="none">无</option>
+          <option value="normal">正向</option>
+          <option value="reverse">反向</option>
+        </select></label>
+      </div>
+      <div class="row">
+        <label>检验人 <input id="operator" type="text"></label>
+        <label>备注 <input id="note" type="text" placeholder="可空"></label>
+      </div>
+      <div class="row btns">
+        <button id="submitReading">录入读数</button>
+        <button id="withdrawLast" title="撤回最近一条有效读数">撤回最近读数</button>
+      </div>
+    </fieldset>
+  </section>
+
+  <aside id="qcRight">
+    <nav id="qcTabs">
+      <button data-tab="anoms" class="tab active">异常 <span id="anomBadge" class="badge hidden"></span></button>
+      <button data-tab="readings" class="tab">读数</button>
+      <button data-tab="import" class="tab">导入</button>
+      <button data-tab="archive" class="tab">归档</button>
+    </nav>
+    <section id="qcTab-anoms" class="qc-panel"></section>
+    <section id="qcTab-readings" class="qc-panel hidden"></section>
+    <section id="qcTab-import" class="qc-panel hidden">
+      <h4>CSV 导入读数</h4>
+      <p class="hint">每行一条：<code>起点,终点,结果,阻值,单位,极性</code>（前三列必填，可含表头）。
+        结果写作 导通/开路（或 ok/open）。导入前会先预览端点匹配与互相冲突的记录。</p>
+      <textarea id="csvText" rows="6" spellcheck="false" placeholder="J1.1,J2.1,导通,0.12,Ω&#10;J1.2,J2.2,开路"></textarea>
+      <div class="row btns">
+        <button id="csvPreviewBtn">解析并预览</button>
+        <button id="csvFileBtn">选择 CSV 文件…</button>
+        <input type="file" id="csvFile" accept=".csv,text/csv" class="hidden">
+      </div>
+      <div id="csvPreviewBox"></div>
+    </section>
+    <section id="qcTab-archive" class="qc-panel hidden"></section>
+  </aside>
+</div>
+
+<footer id="statusbar">
+  <span id="statusHint">就绪</span>
+  <span id="statusPos"></span>
+</footer>
+
+<div id="newBatchModal" class="modal-mask hidden">
+  <div class="modal">
+    <h4>新建检验批次</h4>
+    <p class="hint">从已保存的钉板方案取得连接器、端子与接线网络快照；之后的检验不影响放样方案。</p>
+    <div class="row"><label>钉板方案 <select id="nbDesign"></select></label></div>
+    <div class="row"><label>批次名称 <input id="nbName" type="text"></label></div>
+    <div class="row btns">
+      <button id="nbCreate">创建批次</button>
+      <button id="nbCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/inspect.js"></script>
+</body>
+</html>
