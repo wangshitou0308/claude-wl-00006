@@ -2,7 +2,7 @@
 'use strict';
 
 import {
-  resolvePath, computeBundles, tieList, nodeById, polyLen, dist,
+  resolvePath, computeBundles, tieList, nodeById, polyLen, dist, spliceKind,
 } from './model.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -42,6 +42,33 @@ const ptsAttr = pts => pts.map(p => `${p.x},${p.y}`).join(' ');
 
 function connectorSize(n) {
   return { w: Math.max(34, (n.pins || 4) * 7 + 12), h: 18 };
+}
+
+// 拼接件外形尺寸（含端口圆点）
+export function spliceSize(n) {
+  const ports = Math.max(2, n.ports || 4);
+  return { w: Math.max(18, ports * 6 + 8), h: 13 };
+}
+
+// 某拼接孔位的相对坐标（沿底边均布）
+function splicePortPos(n, pin) {
+  const { w } = spliceSize(n);
+  const ports = Math.max(2, n.ports || 4);
+  const p = Math.min(Math.max(1, pin), ports);
+  return { x: n.x - w / 2 + ((p - 0.5) / ports) * w, y: n.y + 6.5 };
+}
+
+// 渲染用路径：落到拼接件的端收到孔位点（中心线仍解析到拼接中心参与长度/汇束）
+function displayPath(design, wire) {
+  const pts = resolvePath(design, wire);
+  if (pts.length < 2) return pts;
+  const out = pts.map(p => ({ ...p }));
+  for (const [i, side] of [[0, 'from'], [out.length - 1, 'to']]) {
+    const ep = wire[side];
+    const n = ep && ep.node ? nodeById(design, ep.node) : null;
+    if (n && n.type === 'splice') out[i] = { ...splicePortPos(n, ep.pin), node: n.id };
+  }
+  return out;
 }
 
 // ctx: {design, sel, view, opts, step, drawing, layers}
@@ -106,8 +133,13 @@ function renderBundles(ctx) {
 function stepStateOf(ctx, wireId) {
   const st = ctx.step;
   if (!st || !st.active) return 'normal';
-  if (st.confirmed.has(wireId)) return 'done';
-  if (st.order[st.idx] === wireId) return 'current';
+  const step = st.steps ? st.steps[st.idx] : null;
+  if (st.confirmed && st.confirmed.has(wireId)) return 'done';
+  if (step && step.kind === 'wire' && step.wireId === wireId) return 'current';
+  if (step && step.kind === 'splice') {
+    // 拼接步骤：高亮该件所接导线
+    if (step.attaches && step.attaches.some(a => a.wire.id === wireId)) return 'current';
+  }
   return 'dim';
 }
 
@@ -115,7 +147,7 @@ function renderWires(ctx) {
   const { design, layers } = ctx;
   let h = '';
   for (const w of design.wires) {
-    const pts = resolvePath(design, w);
+    const pts = displayPath(design, w);
     if (pts.length < 2) continue;
     const sel = ctx.sel.kind === 'wire' && ctx.sel.id === w.id;
     const st = stepStateOf(ctx, w.id);
@@ -160,11 +192,22 @@ function renderTies(ctx) {
 
 function renderNodes(ctx) {
   const { design, layers } = ctx;
-  // 逐步模式下当前导线经过的节点
+  // 逐步模式下当前导线经过的节点 / 当前拼接件
   const glow = new Set();
-  if (ctx.step && ctx.step.active) {
-    const w = design.wires.find(x => x.id === ctx.step.order[ctx.step.idx]);
-    if (w) for (const p of resolvePath(design, w)) if (p.node) glow.add(p.node);
+  if (ctx.step && ctx.step.active && ctx.step.steps) {
+    const step = ctx.step.steps[ctx.step.idx];
+    if (step) {
+      if (step.kind === 'wire') {
+        const w = design.wires.find(x => x.id === step.wireId);
+        if (w) for (const p of resolvePath(design, w)) if (p.node) glow.add(p.node);
+      } else if (step.kind === 'splice') {
+        glow.add(step.spliceId);
+        for (const a of step.attaches) {
+          const w = design.wires.find(x => x.id === a.wire.id);
+          if (w) for (const p of resolvePath(design, w)) if (p.node) glow.add(p.node);
+        }
+      }
+    }
   }
   let h = '';
   for (const n of design.nodes) {
@@ -184,6 +227,34 @@ function renderNodes(ctx) {
         <rect x="${n.x - w / 2}" y="${n.y - hh / 2}" width="${w}" height="${hh}" rx="2" fill="#dde7f5" stroke="#345" stroke-width="0.7"/>
         ${pins}
         <text x="${n.x}" y="${n.y - hh / 2 - 2}" font-size="5" font-weight="bold" fill="#234" text-anchor="middle" class="halo">${esc(n.name)}</text>
+      </g>`;
+    } else if (n.type === 'splice') {
+      const { w: ww } = spliceSize(n);
+      const kind = spliceKind(n.kind);
+      const ports = Math.max(2, n.ports || 4);
+      let portsH = '';
+      for (let i = 1; i <= ports; i++) {
+        const pp = splicePortPos(n, i);
+        portsH += `<circle cx="${pp.x}" cy="${pp.y}" r="1.3" fill="#fff" stroke="#333" stroke-width="0.4"/>
+                   <text x="${pp.x}" y="${pp.y + 4}" font-size="2.6" fill="#555" text-anchor="middle">${i}</text>`;
+      }
+      let body;
+      if (n.kind === 'cap') {
+        // 闭端帽：锥形帽
+        body = `<path d="M ${n.x - ww / 2 + 3} ${n.y + 4} L ${n.x - ww / 2 + 1} ${n.y - 3} L ${n.x + ww / 2 - 1} ${n.y - 3} L ${n.x + ww / 2 - 3} ${n.y + 4} Z"
+                fill="#efebe9" stroke="${kind.color}" stroke-width="0.8"/>`;
+      } else if (n.kind === 'butt') {
+        // 对接管：两节套筒
+        body = `<rect x="${n.x - ww / 2 + 1}" y="${n.y - 5}" width="${ww - 2}" height="8" rx="1.5" fill="#e8eaf6" stroke="${kind.color}" stroke-width="0.8"/>
+                <line x1="${n.x}" y1="${n.y - 5}" x2="${n.x}" y2="${n.y + 3}" stroke="${kind.color}" stroke-width="0.6"/>`;
+      } else {
+        // 超声焊：圆角方块 + 波纹
+        body = `<rect x="${n.x - ww / 2 + 1}" y="${n.y - 5.5}" width="${ww - 2}" height="9.5" rx="2" fill="#e0f2f1" stroke="${kind.color}" stroke-width="0.8"/>
+                <path d="M ${n.x - 4} ${n.y - 1} q 2 -3 4 0 t 4 0" fill="none" stroke="${kind.color}" stroke-width="0.7"/>`;
+      }
+      h += `<g data-node="${n.id}" style="cursor:move">${ring}${selRing}
+        ${portsH}${body}
+        <text x="${n.x}" y="${n.y - 8}" font-size="4.5" font-weight="bold" fill="${kind.color}" text-anchor="middle" class="halo">${esc(kind.short)} ${esc(n.name)}</text>
       </g>`;
     } else if (n.type === 'branch') {
       h += `<g data-node="${n.id}" style="cursor:move">${ring}${selRing}
@@ -210,12 +281,33 @@ function renderOverlay(ctx) {
   if (ctx.sel.kind === 'wire') {
     const w = design.wires.find(x => x.id === ctx.sel.id);
     if (w && !w.locked) {
-      const pts = resolvePath(design, w);
+      const pts = displayPath(design, w);
       pts.forEach((p, i) => {
-        const bound = p.node ? 1 : 0;
-        h += `<rect class="vhandle" data-vi="${i}" x="${p.x - 4 / z}" y="${p.y - 4 / z}" width="${8 / z}" height="${8 / z}"
-          fill="${bound ? '#ffd166' : '#fff'}" stroke="#2f7df6" stroke-width="${1 / z}" style="cursor:grab"/>`;
+        if (i !== 0 && i !== pts.length - 1) {
+          const bound = p.node ? 1 : 0;
+          h += `<rect class="vhandle" data-vi="${i}" x="${p.x - 4 / z}" y="${p.y - 4 / z}" width="${8 / z}" height="${8 / z}"
+            fill="${bound ? '#ffd166' : '#fff'}" stroke="#2f7df6" stroke-width="${1 / z}" style="cursor:grab"/>`;
+        }
       });
+      // 两端可拖接手柄（拖到连接器/拼接件重接）
+      for (const [i, side] of [[0, 'from'], [pts.length - 1, 'to']]) {
+        const p = pts[i];
+        h += `<circle cx="${p.x}" cy="${p.y}" r="${5 / z}" fill="#2f7df6" fill-opacity="0.25"
+          stroke="#2f7df6" stroke-width="${1.2 / z}" style="cursor:grab"/>`;
+      }
+    }
+  }
+  // 拖接导线端：跟随线 + 落点高亮
+  if (ctx.epDrag) {
+    const w = design.wires.find(x => x.id === ctx.epDrag.wireId);
+    if (w) {
+      const pts = displayPath(design, w);
+      const side = ctx.epDrag.side;
+      const fixed = side === 'from' ? pts[pts.length - 1] : pts[0];
+      const c = ctx.epDrag.cur;
+      h += `<line x1="${fixed.x}" y1="${fixed.y}" x2="${c.x}" y2="${c.y}"
+        stroke="#2f7df6" stroke-width="${1.4 / z}" stroke-dasharray="${4 / z},${2 / z}" style="pointer-events:none"/>`;
+      h += `<circle cx="${c.x}" cy="${c.y}" r="${4.5 / z}" fill="#2f7df6" style="pointer-events:none"/>`;
     }
   }
   // 禁布区拖拽预览

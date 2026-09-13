@@ -153,6 +153,58 @@ ok(any('文件' in p and '冲突' in p for p in pv[4]['problems']), '预览：�
 ok(not pv[5]['ok'], '预览：无法解析行不可导入')
 ok(pv[3]['ok'] and not pv[3]['problems'], '预览：正常行通过')
 
+print('== 拼接件多分支网络 ==')
+
+
+def splice_design():
+    return {
+        'version': 2, 'name': '拼接测试线束',
+        'board': {'width': 900, 'height': 600, 'grid': 10},
+        'settings': {},
+        'nodes': [
+            {'id': 'nJ1', 'type': 'connector', 'x': 80, 'y': 300, 'name': 'J1', 'pins': 4},
+            {'id': 'nJ2', 'type': 'connector', 'x': 700, 'y': 140, 'name': 'J2', 'pins': 4},
+            {'id': 'nJ3', 'type': 'connector', 'x': 700, 'y': 460, 'name': 'J3', 'pins': 4},
+            {'id': 'nS1', 'type': 'splice', 'x': 400, 'y': 300, 'name': 'S1',
+             'kind': 'cap', 'ports': 4, 'gaugeMin': 0.5, 'gaugeMax': 2.4,
+             'strip': 7, 'sleeveD': 4, 'sleeveLen': 15},
+        ],
+        'zones': [],
+        'wires': [
+            {'id': 'w1', 'label': 'W-101', 'from': {'node': 'nJ1', 'pin': 1}, 'to': {'node': 'nS1', 'pin': 1}},
+            {'id': 'w2', 'label': 'W-102', 'from': {'node': 'nS1', 'pin': 2}, 'to': {'node': 'nJ2', 'pin': 1}},
+            {'id': 'w3', 'label': 'W-103', 'from': {'node': 'nJ3', 'pin': 1}, 'to': {'node': 'nS1', 'pin': 3}},
+            {'id': 'w4', 'label': 'W-104', 'from': {'node': 'nJ1', 'pin': 2}, 'to': {'node': 'nJ2', 'pin': 2}},
+        ],
+        'nets': [],
+    }
+
+
+ssnap = qc.build_snapshot(splice_design(), design_id=2, design_name='sp')
+ok(len(ssnap['splices']) == 1 and ssnap['splices'][0]['name'] == 'S1', '快照保留拼接件拓扑')
+ok(ssnap['splices'][0]['ports'] == 4 and ssnap['splices'][0]['strip'] == 7, '快照保留孔位容量与剥线长度')
+snet = next((n for n in ssnap['nets'] if len(n['endpoints']) == 3), None)
+ok(bool(snet), '拼接件追踪出三端网络')
+ok(snet and snet['endpoints'] == ['J1.1', 'J2.1', 'J3.1'], '三端网络端子正确：%s' % (snet and snet['endpoints']))
+ok(snet and snet['splices'] == ['S1'], '网络标注经由拼接件 S1')
+ok(len(ssnap['nets']) == 2, '共 2 个网络（三端 + 双端）')
+
+# 三端网络只需测 2 对即可全覆盖
+an = qc.analyze(ssnap, [R('J1.1', 'J2.1', 'continuity'), R('J2.1', 'J3.1', 'open')])
+kinds = {a['kind'] for a in an['anomalies']}
+ok('open' in kinds, '拼接网络检出开路（同网实测开路）')
+an = qc.analyze(ssnap, [R('J1.1', 'J2.1', 'continuity', ohms=0.1, unit='Ω'),
+                        R('J1.1', 'J3.1', 'continuity', ohms=0.1, unit='Ω'),
+                        R('J1.2', 'J2.2', 'continuity', ohms=0.1, unit='Ω')])
+ok(an['stats']['covered'] == 2 and not an['anomalies'], '拼接网络 2 对导通全覆盖')
+
+# 对接拼接：两段导线连通
+butt = splice_design()
+butt['nodes'][3]['kind'] = 'butt'
+butt['nodes'][3]['ports'] = 3
+bsnap = qc.build_snapshot(butt)
+ok(bsnap['splices'][0]['kind'] == 'butt', '对接拼接类型保留')
+
 print('== 接口（状态机与导入） ==')
 srv = server.create_server('127.0.0.1', 0)
 port = srv.server_address[1]

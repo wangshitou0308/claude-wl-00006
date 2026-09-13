@@ -169,6 +169,12 @@ table.list tr.cur td { background: #bbdefb; }
 .netitem { border: 1px solid #cfd8dc; border-radius: 5px; padding: 5px 8px; margin: 5px 0; background: #fff; font-size: 12px; }
 .netitem.done { border-color: #a5d6a7; background: #f1f8e9; }
 .netitem .eps { font-size: 11px; color: #666; }
+.netitem .viasp { font-size: 11px; color: #8d6e63; font-weight: 700; }
+.asmitem .splicetag {
+  display: inline-block; min-width: 22px; text-align: center; font-size: 11px;
+  background: #efebe9; border: 1px solid #8d6e63; border-radius: 3px; color: #5d4037;
+}
+.asmitem .asmname { flex: 1; }
 .netitem .prog { font-size: 11px; color: #37474f; display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
 .netitem button, .mini { font-size: 11px; padding: 1px 6px; }
 .recitem { padding: 5px 8px; border-radius: 5px; margin: 4px 0; background: #fff; border: 1px solid #cfd8dc; cursor: pointer; font-size: 12px; }

@@ -1,7 +1,7 @@
 // model.js — 线束钉板数据模型与纯计算逻辑（无 DOM 依赖，可在 Node 中单元测试）
 'use strict';
 
-export const VERSION = 1;
+export const VERSION = 2;
 
 export const WIRE_COLORS = [
   ['#d62728', '红'], ['#ff7f0e', '橙'], ['#f2c200', '黄'], ['#2ca02c', '绿'],
@@ -19,6 +19,17 @@ export const GAUGES = [
   { d: 2.8, label: '⌀2.8mm (2.5mm²)' },
   { d: 3.4, label: '⌀3.4mm (4.0mm²)' },
 ];
+
+// 实体拼接件：闭端(闭端子压线帽) / 对接(对接管) / 超声焊(超声波金属焊)
+export const SPLICE_KINDS = [
+  { id: 'cap', name: '闭端拼接', short: '闭', glyph: '🔗', color: '#8d6e63' },
+  { id: 'butt', name: '对接拼接', short: '对', glyph: '🔗', color: '#5c6bc0' },
+  { id: 'ultra', name: '超声焊拼接', short: '焊', glyph: '∿', color: '#00897b' },
+];
+export const spliceKind = k => SPLICE_KINDS.find(x => x.id === k) || SPLICE_KINDS[0];
+
+// 闭端帽线径组合上限：最大/最小外径比不宜超过该值（粗线顶不到帽底、细线压不紧）
+export const CAP_GAUGE_RATIO = 1.6;
 
 let _uid = 1;
 export function uid(prefix = 'id') {
@@ -39,16 +50,57 @@ export function createDesign(name = '未命名线束') {
       tieOffset: 15,       // 分支点绑扎偏移 mm
       roundTo: 5,          // 裁线向上取整 mm
     },
-    nodes: [],   // {id,type:'connector'|'branch'|'nail',x,y,name,pins?}
+    nodes: [],   // {id,type:'connector'|'branch'|'nail'|'splice',x,y,name,pins?}
     zones: [],   // {id,x,y,w,h,name}
     wires: [],   // {id,label,gauge,color,from:{node,pin},to:{node,pin},path:[{x,y,node?}],locked,ends:{from:{strip,crimp,service},to:{...}}}
-    nets: [],    // 接线表 {label,from:'J1.1',to:'J2.3'}
+    nets: [],    // 接线表 {name,endpoints:['J1.1','J2.3',...]}；旧版 {label,from,to} 仍可读
   };
+}
+
+// 旧方案补全：v1（无拼接件）无需手工迁移即可打开
+export function migrateDesign(d) {
+  if (!d || typeof d !== 'object') return d;
+  d.version = d.version || 1;
+  d.nodes = Array.isArray(d.nodes) ? d.nodes : [];
+  d.zones = Array.isArray(d.zones) ? d.zones : [];
+  d.wires = Array.isArray(d.wires) ? d.wires : [];
+  d.nets = Array.isArray(d.nets) ? d.nets : [];
+  for (const n of d.nodes) {
+    if (n.type === 'splice') {
+      n.kind = SPLICE_KINDS.some(k => k.id === n.kind) ? n.kind : 'cap';
+      n.ports = Math.max(2, Math.min(24, n.ports || 4));
+      if (!(n.gaugeMin >= 0)) n.gaugeMin = 0.5;
+      if (!(n.gaugeMax > 0)) n.gaugeMax = 5;
+      n.strip = n.strip ?? 7;
+      n.sleeveD = n.sleeveD ?? 0;
+      n.sleeveLen = n.sleeveLen ?? 0;
+    }
+  }
+  for (const w of d.wires) {
+    if (!w.ends) w.ends = defaultEnds();
+    w.ends.from = w.ends.from || { strip: 5, crimp: '', service: 20 };
+    w.ends.to = w.ends.to || { strip: 5, crimp: '', service: 20 };
+  }
+  return d;
 }
 
 export function makeNode(type, x, y, name, pins) {
   const n = { id: uid('n'), type, x, y, name };
   if (type === 'connector') n.pins = pins || 4;
+  return n;
+}
+
+// 实体拼接件：ports 端口容量（孔位数），gaugeMin/Max 适用线径，
+// strip 默认剥线长度，sleeveD/sleeveLen 保护套（热缩管/焊壳）外径与长度
+export function makeSplice(x, y, name, kind = 'cap', ports = 4) {
+  const n = {
+    id: uid('n'), type: 'splice', x, y, name,
+    kind, ports,
+    gaugeMin: 0.5, gaugeMax: kind === 'cap' ? 2.4 : 3.4,
+    strip: kind === 'ultra' ? 10 : 7,
+    sleeveD: kind === 'butt' ? 5 : kind === 'cap' ? 4 : 0,
+    sleeveLen: kind === 'butt' ? 25 : kind === 'cap' ? 15 : 0,
+  };
   return n;
 }
 
@@ -105,6 +157,118 @@ export function nodeByName(design, name) {
 export function nodeName(design, id) {
   const n = nodeById(design, id);
   return n ? n.name : '?' + String(id).slice(-4);
+}
+
+export function spliceById(design, id) {
+  const n = nodeById(design, id);
+  return n && n.type === 'splice' ? n : null;
+}
+
+// 导线某一侧是否落到拼接件
+export function endpointSplice(design, ep) {
+  return ep && ep.node ? spliceById(design, ep.node) : null;
+}
+
+// ---------- 接线拓扑：沿导线与拼接件追踪连通关系 ----------
+
+class UF {
+  constructor() { this.p = new Map(); }
+  add(x) { if (!this.p.has(x)) this.p.set(x, x); }
+  find(x) {
+    this.add(x);
+    let r = x;
+    while (this.p.get(r) !== r) r = this.p.get(r);
+    while (this.p.get(x) !== r) { const nx = this.p.get(x); this.p.set(x, r); x = nx; }
+    return r;
+  }
+  union(a, b) { this.add(a); this.add(b); const ra = this.find(a), rb = this.find(b); if (ra !== rb) this.p.set(ra, rb); }
+  same(a, b) { return this.find(a) === this.find(b); }
+}
+
+// 设计中被导线占用的端点：'nodeId:pin' → [{wire,side}]
+export function pinOccupancy(design) {
+  const occ = new Map();
+  for (const w of design.wires) {
+    for (const side of ['from', 'to']) {
+      const ep = w[side];
+      if (!ep || !ep.node) continue;
+      const k = ep.node + ':' + ep.pin;
+      if (!occ.has(k)) occ.set(k, []);
+      occ.get(k).push({ wire: w, side });
+    }
+  }
+  return occ;
+}
+
+// 规范化接线表：旧版 {label,from,to} → {name:label,endpoints:[from,to]}
+export function normalizeNets(nets) {
+  return (nets || []).map(n => {
+    if (Array.isArray(n.endpoints)) return { name: n.name ?? n.label ?? 'NET', endpoints: n.endpoints.map(String) };
+    return { name: n.name ?? n.label ?? 'NET', endpoints: [String(n.from || ''), String(n.to || '')] };
+  });
+}
+
+// 沿导线与拼接件并查集，求物理连通分量（端子字符串集合）。
+// 拼接件的所有孔位内部导通；悬空的拼接孔位不计入端子。
+export function physicalTopology(design) {
+  const uf = new UF();
+  const links = []; // {a,b,wire,side?} 有效连通段
+  const wireEnds = new Map(); // wireId → [端子或null, 端子或null]
+  const termNode = new Map(); // 端串 → 连接器节点
+  for (const w of design.wires) {
+    const eps = [];
+    for (const side of ['from', 'to']) {
+      const ep = w[side];
+      const n = ep && ep.node ? nodeById(design, ep.node) : null;
+      if (n && n.type === 'connector' && ep.pin >= 1) {
+        const t = `${n.name}.${ep.pin}`;
+        eps.push(t);
+        termNode.set(t, n);
+      } else {
+        eps.push(null);
+      }
+    }
+    wireEnds.set(w.id, eps);
+    const [a, b] = eps;
+    if (a && b && a !== b) {
+      uf.union(a, b);
+      links.push({ a, b, wire: w.id });
+    }
+  }
+  // 拼接件把同件各孔所连导线的连接器端子全部并起来
+  for (const sp of design.nodes.filter(n => n.type === 'splice')) {
+    const terms = new Set();
+    for (const w of design.wires) {
+      for (const side of ['from', 'to']) {
+        const ep = w[side];
+        if (!ep || ep.node !== sp.id) continue;
+        // 取拼接孔对侧的连接器端子（本侧是拼接件，其端子串为 null）
+        const t = wireEnds.get(w.id)[side === 'from' ? 1 : 0];
+        if (t) terms.add(t);
+      }
+    }
+    const arr = [...terms];
+    for (let i = 1; i < arr.length; i++) uf.union(arr[0], arr[i]);
+  }
+  // 汇总分量
+  const groups = new Map();
+  for (const t of termNode.keys()) {
+    const r = uf.find(t);
+    if (!groups.has(r)) groups.set(r, new Set());
+    groups.get(r).add(t);
+  }
+  return { uf, groups, links, wireEnds };
+}
+
+// 每根导线连通到的连接器端子（自身端优先），及所在物理分量
+export function wireTerminals(design) {
+  const { uf, wireEnds } = physicalTopology(design);
+  const out = new Map();
+  for (const w of design.wires) {
+    const [a, b] = wireEnds.get(w.id) || [null, null];
+    out.set(w.id, { from: a, to: b, uf });
+  }
+  return out;
 }
 
 // ---------- 几何 ----------
@@ -185,8 +349,17 @@ export function cutInfo(design, wire) {
 }
 
 export function endpointStr(design, ep) {
-  if (!ep || !ep.node) return '(未接)';
-  return `${nodeName(design, ep.node)}.${ep.pin}`;
+  if (!ep || !ep.node) return '(悬空)';
+  const n = nodeById(design, ep.node);
+  if (!n) return '(悬空)';
+  if (n.type === 'splice') return `${n.name}#${ep.pin}`;
+  return `${n.name}.${ep.pin}`;
+}
+
+// 端对端目标的人类描述：拼接件给出类型与孔位
+export function endpointKind(design, ep) {
+  const n = ep && ep.node ? nodeById(design, ep.node) : null;
+  return n && n.type === 'splice' ? 'splice' : n ? n.type : 'none';
 }
 
 // 解析 "J1.3" → {conn:'J1', pin:3}
@@ -352,16 +525,18 @@ export function validate(design) {
   }
 
   for (const w of design.wires) {
-    // 端点有效性
+    // 端点有效性（连接器端子或拼接件孔位）
     for (const side of ['from', 'to']) {
       const ep = w[side];
       const cn = ep && ep.node ? nodeById(design, ep.node) : null;
       if (!cn) {
-        issues.push({ level: 'error', kind: 'endpoint', wire: w.id, msg: `${w.label}：${side === 'from' ? '起点' : '终点'}未连接到连接器` });
-      } else if (cn.type !== 'connector') {
-        issues.push({ level: 'error', kind: 'endpoint', wire: w.id, node: cn.id, msg: `${w.label}：端点 ${cn.name} 不是连接器` });
-      } else if (!(ep.pin >= 1 && ep.pin <= cn.pins)) {
+        issues.push({ level: 'error', kind: 'endpoint', wire: w.id, msg: `${w.label}：${side === 'from' ? '起点' : '终点'}悬空，未连接到连接器或拼接件` });
+      } else if (cn.type === 'connector' && !(ep.pin >= 1 && ep.pin <= cn.pins)) {
         issues.push({ level: 'error', kind: 'endpoint', wire: w.id, node: cn.id, msg: `${w.label}：端子 ${cn.name}.${ep.pin} 超出针位范围(1-${cn.pins})` });
+      } else if (cn.type === 'splice' && !(ep.pin >= 1 && ep.pin <= cn.ports)) {
+        issues.push({ level: 'error', kind: 'endpoint', wire: w.id, node: cn.id, msg: `${w.label}：${cn.name} 孔位 ${ep.pin} 超出容量(1-${cn.ports})` });
+      } else if (cn.type !== 'connector' && cn.type !== 'splice') {
+        issues.push({ level: 'error', kind: 'endpoint', wire: w.id, node: cn.id, msg: `${w.label}：端点 ${cn.name} 既不是连接器也不是拼接件` });
       }
     }
 
@@ -439,35 +614,175 @@ export function validate(design) {
     }
   }
 
-  // 接线表核对（线号接错端点）
-  const netMap = new Map(design.nets.map(n => [n.label, n]));
-  for (const w of design.wires) {
-    const net = netMap.get(w.label);
-    if (!net) {
-      if (design.nets.length) {
-        issues.push({ level: 'info', kind: 'nonet', wire: w.id, msg: `${w.label} 未列入接线表` });
+  // 拼接件：悬空、超容、线径组合、保护套、禁布区
+  for (const sp of design.nodes.filter(n => n.type === 'splice')) {
+    const att = [];
+    for (const w of design.wires) {
+      for (const side of ['from', 'to']) {
+        const ep = w[side];
+        if (ep && ep.node === sp.id) att.push({ wire: w, side, pin: ep.pin });
       }
-      continue;
     }
-    const ef = parseEndpoint(net.from), et = parseEndpoint(net.to);
-    if (!ef || !et) {
-      issues.push({ level: 'warn', kind: 'net', wire: w.id, msg: `接线表 ${w.label} 端点格式无法解析（应为 J1.1 形式）` });
-      continue;
+    // 拼接位置侵入禁布区
+    for (const z of design.zones) {
+      if (pointInRect(sp, z)) {
+        issues.push({ level: 'error', kind: 'splice-zone', node: sp.id, zone: z.id,
+          msg: `拼接件 ${sp.name} 位于禁布区「${z.name}」内` });
+      }
     }
-    const af = w.from && w.from.node ? { conn: nodeName(design, w.from.node), pin: w.from.pin } : null;
-    const at = w.to && w.to.node ? { conn: nodeName(design, w.to.node), pin: w.to.pin } : null;
-    const eq = (a, b) => a && b && a.conn === b.conn && a.pin === b.pin;
+    if (att.length === 0) {
+      issues.push({ level: 'warn', kind: 'splice-dangling', node: sp.id, msg: `拼接件 ${sp.name} 未接入任何导线（悬空拼接点）` });
+    } else if (att.length < 2) {
+      const a = att[0];
+      issues.push({ level: 'warn', kind: 'splice-dangling', node: sp.id, wire: a.wire.id,
+        msg: `拼接件 ${sp.name} 仅接 1 根导线（${a.wire.label}），未形成拼接（悬空端）` });
+    }
+    // 端口超容：不同导线落到同一孔位
+    const pins = new Map();
+    for (const a of att) {
+      if (!pins.has(a.pin)) pins.set(a.pin, []);
+      pins.get(a.pin).push(a.wire);
+    }
+    // 端口超容：孔位重复由上方端子重复占用覆盖；此处报容量（att 数不超 ports 即不超容，
+    // 但允许同孔重复会绕过容量，故显式按占用孔位数检查）
+    const usedPins = [...pins.keys()].filter(p => p >= 1 && p <= sp.ports);
+    if (usedPins.length > sp.ports) {
+      issues.push({ level: 'error', kind: 'splice-cap', node: sp.id,
+        msg: `拼接件 ${sp.name} 端口超容：占用 ${usedPins.length} 孔 > 容量 ${sp.ports}` });
+    }
+    // 线径组合
+    const gauges = att.map(a => a.wire.gauge);
+    const gmin = Math.min(...gauges), gmax = Math.max(...gauges);
+    for (const a of att) {
+      if (a.wire.gauge < sp.gaugeMin - 1e-9 || a.wire.gauge > sp.gaugeMax + 1e-9) {
+        issues.push({ level: 'error', kind: 'splice-gauge', node: sp.id, wire: a.wire.id,
+          msg: `${a.wire.label} 线径 ⌀${a.wire.gauge} 超出 ${sp.name} 适用线径（⌀${sp.gaugeMin}~⌀${sp.gaugeMax}）` });
+      }
+    }
+    if (att.length >= 2 && sp.kind === 'cap' && gmin > 0 && gmax / gmin > CAP_GAUGE_RATIO + 1e-9) {
+      issues.push({ level: 'error', kind: 'splice-gauge', node: sp.id,
+        msg: `闭端拼接 ${sp.name} 线径组合不适配：⌀${gmax}/⌀${gmin} = ${(gmax / gmin).toFixed(2)} > ${CAP_GAUGE_RATIO}（细线压不紧）` });
+    }
+    // 保护套尺寸缺失（对接件通常必须热缩）
+    if (sp.kind === 'butt' && !(sp.sleeveD > 0 && sp.sleeveLen > 0)) {
+      issues.push({ level: 'warn', kind: 'splice-sleeve', node: sp.id,
+        msg: `对接拼接 ${sp.name} 未填写保护套（热缩管）外径/长度` });
+    }
+  }
+
+  // ---------- 接线网络：沿导线 + 拼接件追踪连通关系 ----------
+  const nets = normalizeNets(design.nets);
+  const topo = physicalTopology(design);
+
+  // 接线表自身：同一端子被多个网络名声明（跨网合并的表内版本）
+  const decl = new Map(); // ep → [netName...]
+  for (const n of nets) {
+    for (const ep of n.endpoints) {
+      if (!parseEndpoint(ep)) continue;
+      if (!decl.has(ep)) decl.set(ep, []);
+      decl.get(ep).push(n.name);
+    }
+  }
+  for (const [ep, names] of decl) {
+    const uniq = [...new Set(names)];
+    if (uniq.length > 1) {
+      issues.push({ level: 'error', kind: 'net-merge',
+        msg: `接线表冲突：${ep} 同时归入网络 ${uniq.join('、')}` });
+    }
+  }
+
+  // 端子 → 网络名
+  const netOf = new Map();
+  for (const n of nets) for (const ep of n.endpoints) if (parseEndpoint(ep)) netOf.set(ep, n.name);
+
+  // 端点存在性：接线表中写到方案里不存在的端子
+  const validTerms = new Set();
+  for (const c of design.nodes.filter(n => n.type === 'connector')) {
+    for (let p = 1; p <= (c.pins || 4); p++) validTerms.add(`${c.name}.${p}`);
+  }
+  for (const [ep] of netOf) {
+    if (!validTerms.has(ep)) {
+      issues.push({ level: 'warn', kind: 'net', msg: `接线表端子 ${ep} 在方案连接器中不存在` });
+    }
+  }
+
+  // 物理分量 → 端子集合，逐个与接线表网络名核对
+  const compList = [...topo.groups.values()].map(s => [...s]);
+  for (const comp of compList) {
+    const names = new Set();
+    const missing = [];
+    for (const ep of comp) {
+      if (netOf.has(ep)) names.add(netOf.get(ep));
+      else missing.push(ep);
+    }
+    if (names.size > 1) {
+      // 跨网合并：不同网络名的端子经导线/拼接件被物理导通
+      issues.push({ level: 'error', kind: 'net-merge',
+        msg: `跨网合并：${comp.sort().join('、')} 物理连通，却分属网络 ${[...names].join('、')}` });
+    }
+    if (names.size >= 1 && missing.length) {
+      issues.push({ level: 'warn', kind: 'net',
+        msg: `端子 ${missing.join('、')} 与网络「${[...names][0]}」物理连通，但未列入接线表` });
+    }
+  }
+
+  // 导线两端落入同网：去掉本线后两端仍经其余导线/拼接件导通 → 冗余成环
+  for (const w of design.wires) {
+    const [a, b] = topo.wireEnds.get(w.id) || [null, null];
+    if (!a || !b) continue;
+    const netA = netOf.get(a), netB = netOf.get(b);
+    if (netA && netB && netA === netB) {
+      // 两端同网。若去掉本线（保留拼接件）仍连通，则本线为冗余闭环支路
+      const rest = { ...design, wires: design.wires.filter(x => x.id !== w.id) };
+      const t2 = physicalTopology(rest);
+      if (t2.uf.find(a) === t2.uf.find(b)) {
+        issues.push({ level: 'warn', kind: 'net-loop', wire: w.id,
+          msg: `${w.label} 两端落入同一网络「${netA}」且不经本线已连通，构成冗余回路（${a}—${b}）` });
+      }
+    }
+  }
+
+  // 线号接错端点：接线表以线号为网络名的旧格式行，仍逐根比对（兼容旧方案）
+  const legacyByName = new Map();
+  for (const n of nets) for (const ep of n.endpoints) legacyByName.set(ep + '@' + n.name, n);
+  for (const w of design.wires) {
+    const rows = nets.filter(n => n.name === w.label && n.endpoints.length === 2);
+    if (!rows.length) continue;
+    const row = rows[0];
+    const ef = parseEndpoint(row.endpoints[0]), et = parseEndpoint(row.endpoints[1]);
+    if (!ef || !et) continue;
+    const ep2t = ep => {
+      const cn = ep && ep.node ? nodeById(design, ep.node) : null;
+      return cn && cn.type === 'connector' ? { conn: cn.name, pin: ep.pin } : null;
+    };
+    const af = ep2t(w.from), at = ep2t(w.to);
+    const eq = (x, y) => x && y && x.conn === y.conn && x.pin === y.pin;
     const ok = (eq(af, ef) && eq(at, et)) || (eq(af, et) && eq(at, ef));
     if (!ok) {
       issues.push({
         level: 'error', kind: 'net', wire: w.id,
-        msg: `${w.label} 线号接错端点：应为 ${net.from}→${net.to}，实际 ${af ? af.conn + '.' + af.pin : '(未接)'}→${at ? at.conn + '.' + at.pin : '(未接)'}`,
+        msg: `${w.label} 线号接错端点：应为 ${row.endpoints[0]}→${row.endpoints[1]}，实际 ${af ? af.conn + '.' + af.pin : '(未接)'}→${at ? at.conn + '.' + at.pin : '(未接)'}`,
       });
     }
   }
-  for (const n of design.nets) {
-    if (!byLabel.has(n.label)) {
-      issues.push({ level: 'info', kind: 'orphan', msg: `接线表线号 ${n.label} 尚未布线` });
+
+  // 接线表网络尚未连通（网络内端子在物理上分成多个分量）
+  for (const n of nets) {
+    const eps = n.endpoints.filter(ep => parseEndpoint(ep) && validTerms.has(ep));
+    for (let i = 1; i < eps.length; i++) {
+      if (topo.uf.find(eps[0]) !== topo.uf.find(eps[i])) {
+        issues.push({ level: 'info', kind: 'net-open',
+          msg: `网络「${n.name}」未连通：${eps[0]} 与 ${eps[i]} 之间缺少导线/拼接路径` });
+        break;
+      }
+    }
+  }
+  // 接线表网络在方案中完全没有导线
+  const wiredTerms = new Set();
+  for (const eps of topo.wireEnds.values()) { if (eps[0]) wiredTerms.add(eps[0]); if (eps[1]) wiredTerms.add(eps[1]); }
+  for (const n of nets) {
+    if (!n.endpoints.some(ep => wiredTerms.has(ep))) {
+      issues.push({ level: 'info', kind: 'orphan', msg: `接线表网络「${n.name}」尚未布线` });
     }
   }
 
@@ -481,15 +796,42 @@ export function validate(design) {
 export function cutList(design) {
   return design.wires.map(w => {
     const c = cutInfo(design, w);
+    const spF = endpointSplice(design, w.from), spT = endpointSplice(design, w.to);
     return {
       id: w.id, label: w.label, color: w.color, gauge: w.gauge,
       from: endpointStr(design, w.from), to: endpointStr(design, w.to),
+      spliceFrom: spF ? `${spF.name}#${w.from.pin}` : '',
+      spliceTo: spT ? `${spT.name}#${w.to.pin}` : '',
+      sleeveFrom: spF && spF.sleeveD > 0 ? `⌀${spF.sleeveD}×${spF.sleeveLen}` : '',
+      sleeveTo: spT && spT.sleeveD > 0 ? `⌀${spT.sleeveD}×${spT.sleeveLen}` : '',
       path: c.path, svc: c.svc, strip: c.strip, cut: c.cut, rounded: c.rounded,
       stripFrom: w.ends.from.strip, stripTo: w.ends.to.strip,
       crimpFrom: w.ends.from.crimp, crimpTo: w.ends.to.crimp,
       locked: !!w.locked,
     };
   }).sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN', { numeric: true }));
+}
+
+// 拼接件清单（下料/打印用）
+export function spliceList(design) {
+  return design.nodes.filter(n => n.type === 'splice').map(sp => {
+    const wires = [];
+    for (const w of design.wires) {
+      for (const side of ['from', 'to']) {
+        const ep = w[side];
+        if (ep && ep.node === sp.id) wires.push({ wire: w, side, pin: ep.pin });
+      }
+    }
+    const gauges = wires.map(x => x.wire.gauge);
+    return {
+      id: sp.id, name: sp.name, kind: sp.kind, kindName: spliceKind(sp.kind).name,
+      ports: sp.ports, gaugeMin: sp.gaugeMin, gaugeMax: sp.gaugeMax,
+      strip: sp.strip, sleeveD: sp.sleeveD, sleeveLen: sp.sleeveLen,
+      count: wires.length, wires,
+      gaugeRange: gauges.length ? `${Math.min(...gauges)}~${Math.max(...gauges)}` : '',
+      x: sp.x, y: sp.y,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true }));
 }
 
 export function materialSummary(design) {
@@ -597,6 +939,34 @@ export function assemblyOrder(design) {
   })).sort((a, b) => (b.shared - a.shared) || (b.length - a.length));
 }
 
+// 装配步骤：先逐根送线，再按拼接件引导集线/压接/套管。
+// 拼接步骤在其所属导线全部敷设之后；就绪度 = 已确认导线数 / 接入导线数。
+export function assemblySteps(design, confirmedWires) {
+  const order = assemblyOrder(design);
+  const wireIdx = new Map(order.map((o, i) => [o.wireId, i]));
+  const steps = order.map(o => ({ kind: 'wire', wireId: o.wireId, label: o.label, order: o }));
+  for (const sp of design.nodes.filter(n => n.type === 'splice')) {
+    const att = [];
+    for (const w of design.wires) {
+      for (const side of ['from', 'to']) {
+        if (w[side] && w[side].node === sp.id) att.push({ wire: w, side });
+      }
+    }
+    const maxIdx = Math.max(-1, ...att.map(a => wireIdx.get(a.wire.id) ?? -1));
+    const done = att.filter(a => confirmedWires.has(a.wire.id)).length;
+    steps.push({
+      kind: 'splice', spliceId: sp.id,
+      label: `${spliceKind(sp.kind).name} ${sp.name}`,
+      splice: sp, attaches: att, count: att.length,
+      doneWires: done, ready: att.length >= 2 && done === att.length,
+      sort: maxIdx + 0.5,
+    });
+  }
+  // 导线按原序号，拼接件排在最后一根所属导线之后
+  return steps.map((s, i) => ({ ...s, sort: s.kind === 'wire' ? i : s.sort }))
+    .sort((a, b) => a.sort - b.sort);
+}
+
 // ---------- 路径整理（跳过锁定） ----------
 
 export function tidyDesign(design, snapRadius = 4) {
@@ -631,13 +1001,22 @@ export function tidyDesign(design, snapRadius = 4) {
   return changed;
 }
 
-// 从现有布线生成接线表
+// 从现有布线生成接线表：同一网络名可描述多个连接器端子（沿拼接件追踪）。
+// 若方案已有同名网络，沿用其名字；否则按物理分量生成 NET-n。
 export function autoNets(design) {
-  design.nets = design.wires.map(w => ({
-    label: w.label,
-    from: endpointStr(design, w.from),
-    to: endpointStr(design, w.to),
-  }));
+  const prev = normalizeNets(design.nets);
+  const nameOf = new Map();
+  for (const n of prev) for (const ep of n.endpoints) nameOf.set(ep, n.name);
+  const { groups } = physicalTopology(design);
+  const comps = [...groups.values()]
+    .map(s => [...s].sort())
+    .sort((a, b) => a[0].localeCompare(b[0], 'zh-Hans-CN', { numeric: true }));
+  design.nets = comps.map((eps, i) => {
+    const used = new Set();
+    for (const ep of eps) { const nm = nameOf.get(ep); if (nm) used.add(nm); }
+    const name = used.size === 1 ? [...used][0] : 'NET-' + (i + 1);
+    return { name, endpoints: eps };
+  });
   return design.nets.length;
 }
 
@@ -648,11 +1027,15 @@ export function sampleDesign() {
   const J1 = makeNode('connector', 80, 300, 'J1', 6);
   const J2 = makeNode('connector', 780, 140, 'J2', 4);
   const J3 = makeNode('connector', 780, 460, 'J3', 4);
+  const J4 = makeNode('connector', 420, 540, 'J4', 3);
   const B1 = makeNode('branch', 420, 300, 'B1');
   const N1 = makeNode('nail', 240, 300, 'N1');
   const N2 = makeNode('nail', 600, 200, 'N2');
   const N3 = makeNode('nail', 600, 400, 'N3');
-  d.nodes.push(J1, J2, J3, B1, N1, N2, N3);
+  const N4 = makeNode('nail', 360, 470, 'N4');
+  // 实体拼接件：闭端帽，把 J1.5、J3.2、J4.1 并为同一网络
+  const S1 = makeSplice(470, 470, 'S1', 'cap', 4);
+  d.nodes.push(J1, J2, J3, J4, B1, N1, N2, N3, N4, S1);
   d.zones.push(makeZone(500, 260, 60, 80, '禁布区'));
 
   const mk = (label, color, gauge, from, fp, to, tp, mids) => {
@@ -669,9 +1052,19 @@ export function sampleDesign() {
     mk('W-102', '#1f77b4', 1.6, J1.id, 2, J2.id, 2, [nb(N1.id), nb(B1.id), nb(N2.id)]),
     mk('W-103', '#2ca02c', 1.3, J1.id, 3, J2.id, 3, [nb(N1.id), nb(B1.id), nb(N2.id)]),
     mk('W-104', '#f2c200', 1.3, J1.id, 4, J3.id, 1, [nb(N1.id), nb(B1.id), nb(N3.id)]),
-    mk('W-105', '#9467bd', 1.0, J1.id, 5, J3.id, 2, [nb(N1.id), nb(B1.id), nb(N3.id)]),
     mk('W-106', '#222222', 2.4, J1.id, 6, J3.id, 3, [nb(N1.id), nb(B1.id), nb(N3.id)]),
+    // 三支拼接网络：J1.5 —S1— J3.2 / J4.1
+    mk('W-105', '#9467bd', 1.3, J1.id, 5, S1.id, 1, [nb(N1.id), nb(B1.id), nb(N4.id)]),
+    mk('W-107', '#17becf', 1.3, S1.id, 2, J3.id, 2, [nb(N3.id)]),
+    mk('W-108', '#e377c2', 1.3, J4.id, 1, S1.id, 3, [{ x: 430, y: 500 }]),
   );
+  // 拼接孔位剥线默认取拼接件设置
+  for (const w of d.wires) {
+    for (const side of ['from', 'to']) {
+      const sp = spliceById(d, w[side].node);
+      if (sp) w.ends[side].strip = sp.strip;
+    }
+  }
   autoNets(d);
   return d;
 }

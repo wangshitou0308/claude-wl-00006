@@ -14,6 +14,11 @@
     <button data-tool="connector" class="tool" title="放置连接器 (J)">连接器</button>
     <button data-tool="branch" class="tool" title="放置分支点 (B)">分支点</button>
     <button data-tool="nail" class="tool" title="放置固定钉 (N)">固定钉</button>
+    <span class="tb-group splice-tools" style="gap:2px">
+      <button data-tool="splice" data-kind="cap" class="tool" title="放置闭端拼接件 (S)">🔗闭端</button>
+      <button data-tool="splice" data-kind="butt" class="tool" title="放置对接拼接件">对接</button>
+      <button data-tool="splice" data-kind="ultra" class="tool" title="放置超声焊拼接件">超声焊</button>
+    </span>
     <button data-tool="zone" class="tool" title="拖出禁布区 (Z)">禁布区</button>
     <button data-tool="wire" class="tool" title="布线：点连接器起点→途经点→连接器终点 (W)">布线</button>
   </span>
@@ -93,9 +98,10 @@
       </div>
       <h4>本地存档</h4>
       <div id="saveList" class="savelist">（尚未保存）</div>
-      <h4>接线表（用于核对“线号接错端点”）</h4>
-      <p class="hint">每行一条：<code>线号 起点 终点</code>，端点写作 <code>J1.3</code>（连接器.针）。</p>
-      <textarea id="netlist" rows="6" spellcheck="false"></textarea>
+      <h4>接线表（同一网络名可含多个端子）</h4>
+      <p class="hint">每行一条：<code>网络名 端子1 端子2 [端子3 …]</code>，端点写作 <code>J1.3</code>（连接器.针）。
+      同一网络名出现多行即合并为多分支网络；旧格式 <code>线号 起点 终点</code> 仍可读取。</p>
+      <textarea id="netlist" rows="8" spellcheck="false" placeholder="PWR J1.1 J2.1 J3.2&#10;GND J1.2 J2.2"></textarea>
       <div class="row btns">
         <button id="netsApply">应用接线表</button>
         <button id="netsAuto">从布线生成</button>

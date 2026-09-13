@@ -11,13 +11,15 @@ const state = {
   design: M.createDesign(),
   savedId: null,
   tool: 'select',
+  spliceKind: 'cap', // 当前放置的拼接件类型
   sel: { kind: null, id: null },       // kind: node|wire|zone
   view: { tx: 30, ty: 30, z: 1 },
   opts: { snap: true, showBundles: true, showTies: false, showLabels: true },
   drawing: null,   // 布线中 {from:{node,pin}, pts:[], cursor}
   preview: null,   // 禁布区拖拽预览 {x,y,w,h}
-  step: null,      // 逐步推演 {active,order,idx,confirmed:Set,lock}
+  step: null,      // 逐步推演 {active,steps,idx,confirmed:Set,locks:Set,lock}
   drag: null,
+  epDrag: null,    // 拖接导线端 {wireId,side,start,cur,moved}
 };
 
 const $ = id => document.getElementById(id);
@@ -34,6 +36,7 @@ const ctx = {
   get step() { return state.step; },
   get drawing() { return state.drawing; },
   get preview() { return state.preview; },
+  get epDrag() { return state.epDrag; },
   layers,
 };
 
@@ -49,13 +52,13 @@ function checkpoint() {
 function undo() {
   if (!undoStack.length) return;
   redoStack.push(JSON.stringify(state.design));
-  state.design = JSON.parse(undoStack.pop());
+  state.design = M.migrateDesign(JSON.parse(undoStack.pop()));
   afterLoad(); refreshUndoBtns();
 }
 function redo() {
   if (!redoStack.length) return;
   undoStack.push(JSON.stringify(state.design));
-  state.design = JSON.parse(redoStack.pop());
+  state.design = M.migrateDesign(JSON.parse(redoStack.pop()));
   afterLoad(); refreshUndoBtns();
 }
 function refreshUndoBtns() {
@@ -125,6 +128,7 @@ function setStatus(t) { $('statusHint').textContent = t; }
 // ---------- 命中测试 ----------
 
 function connSize(n) { return { w: Math.max(34, (n.pins || 4) * 7 + 12), h: 18 }; }
+function spliceSize(n) { return { w: Math.max(18, Math.max(2, n.ports || 4) * 6 + 8), h: 13 }; }
 
 function nodeAt(p) {
   const tol = 8 / state.view.z;
@@ -133,6 +137,9 @@ function nodeAt(p) {
     if (n.type === 'connector') {
       const { w, h } = connSize(n);
       if (Math.abs(p.x - n.x) <= w / 2 + tol && Math.abs(p.y - n.y) <= h / 2 + tol) return n;
+    } else if (n.type === 'splice') {
+      const { w, h } = spliceSize(n);
+      if (Math.abs(p.x - n.x) <= w / 2 + tol && Math.abs(p.y - n.y) <= h / 2 + 2 + tol) return n;
     } else if (Math.hypot(p.x - n.x, p.y - n.y) <= (n.type === 'branch' ? 7 : 6) + tol) {
       return n;
     }
@@ -170,6 +177,38 @@ function vertexAt(p) {
   return -1;
 }
 
+// 选中导线两端的可拖接手柄（拼接件端收到孔位点）
+function epHandleAt(p) {
+  if (state.sel.kind !== 'wire') return null;
+  const w = M.wireById(state.design, state.sel.id);
+  if (!w || w.locked) return null;
+  const pts = displayPathForHit(state.design, w);
+  const tol = 9 / state.view.z;
+  for (const [i, side] of [[0, 'from'], [pts.length - 1, 'to']]) {
+    const q = pts[i];
+    if (Math.hypot(p.x - q.x, p.y - q.y) <= tol) return { side, x: q.x, y: q.y };
+  }
+  return null;
+}
+
+// 与 render.displayPath 等价的命中坐标（拼接端收到孔位）
+function displayPathForHit(design, w) {
+  const pts = M.resolvePath(design, w);
+  return pts.map((p, i) => {
+    const side = i === 0 ? 'from' : i === pts.length - 1 ? 'to' : null;
+    if (!side) return p;
+    const ep = w[side];
+    const n = ep && ep.node ? M.nodeById(design, ep.node) : null;
+    if (n && n.type === 'splice') {
+      const ww = Math.max(18, Math.max(2, n.ports || 4) * 6 + 8);
+      const ports = Math.max(2, n.ports || 4);
+      const pin = Math.min(Math.max(1, ep.pin), ports);
+      return { x: n.x - ww / 2 + ((pin - 0.5) / ports) * ww, y: n.y + 6.5, node: n.id };
+    }
+    return p;
+  });
+}
+
 // 吸附：优先就近节点（绑定），其次网格
 function snapPt(p, allowNode = true) {
   if (allowNode) {
@@ -188,23 +227,25 @@ function snapPt(p, allowNode = true) {
 // ---------- 端子选择弹窗 ----------
 
 let pinCb = null;
-function occupiedPins(connId, extra) {
+function occupiedPins(nodeId, extra) {
   const occ = new Map();
   for (const w of state.design.wires) {
     for (const side of ['from', 'to']) {
       const ep = w[side];
-      if (ep && ep.node === connId) occ.set(ep.pin, w.label);
+      if (ep && ep.node === nodeId) occ.set(ep.pin, w.label);
     }
   }
   if (extra) occ.set(extra.pin, '本线');
   return occ;
 }
-function showPinPicker(conn, title, extraPin, cb) {
+function showPinPicker(node, title, extraPin, cb) {
   const pk = $('pinPicker');
-  const occ = occupiedPins(conn.id, extraPin);
-  const s = toScreen(conn);
-  let h = `<h5>${esc(title)}：${esc(conn.name)} 端子</h5><div class="pins">`;
-  for (let i = 1; i <= (conn.pins || 4); i++) {
+  const isSplice = node.type === 'splice';
+  const count = isSplice ? Math.max(2, node.ports || 4) : (node.pins || 4);
+  const occ = occupiedPins(node.id, extraPin);
+  const s = toScreen(node);
+  let h = `<h5>${esc(title)}：${esc(node.name)} ${isSplice ? '孔位' : '端子'}</h5><div class="pins">`;
+  for (let i = 1; i <= count; i++) {
     const o = occ.get(i);
     h += `<button data-pin="${i}" class="${o ? 'occ' : ''}" ${o ? 'disabled' : ''} title="${o ? '已被 ' + esc(o) + ' 占用' : ''}">${i}</button>`;
   }
@@ -256,6 +297,12 @@ canvas.addEventListener('pointerdown', e => {
       state.drag = { type: 'vertex', idx: vi, ck: false };
       return;
     }
+    const eh = epHandleAt(p);
+    if (eh) {
+      state.epDrag = { wireId: state.sel.id, side: eh.side, start: { x: eh.x, y: eh.y }, cur: p, moved: false };
+      state.drag = { type: 'ep', ck: false };
+      return;
+    }
     const n = nodeAt(p);
     if (n) {
       state.sel = { kind: 'node', id: n.id };
@@ -292,6 +339,18 @@ canvas.addEventListener('pointerdown', e => {
     return;
   }
 
+  if (state.tool === 'splice') {
+    const sp = snapPt(p, false);
+    checkpoint();
+    const count = state.design.nodes.filter(n => n.name.startsWith('S')).length + 1;
+    const node = M.makeSplice(sp.x, sp.y, 'S' + count, state.spliceKind || 'cap',
+      state.spliceKind === 'cap' ? 4 : state.spliceKind === 'butt' ? 3 : 4);
+    state.design.nodes.push(node);
+    state.sel = { kind: 'node', id: node.id };
+    refreshAll();
+    return;
+  }
+
   if (state.tool === 'zone') {
     state.drag = { type: 'zoneNew', x0: p.x, y0: p.y };
     state.preview = { x: p.x, y: p.y, w: 0, h: 0 };
@@ -300,22 +359,25 @@ canvas.addEventListener('pointerdown', e => {
 
   if (state.tool === 'wire') {
     const n = nodeAt(p);
+    const connectable = n && (n.type === 'connector' || n.type === 'splice');
     if (!state.drawing) {
-      if (n && n.type === 'connector') {
-        showPinPicker(n, '选择起点端子', null, pin => {
+      if (connectable) {
+        const word = n.type === 'splice' ? '选择起点孔位' : '选择起点端子';
+        showPinPicker(n, word, null, pin => {
           state.drawing = { from: { node: n.id, pin }, pts: [{ x: n.x, y: n.y, node: n.id }], cursor: null };
-          setStatus(`布线中：${n.name}.${pin} → 点击画布加途经点（可吸附钉/分支点），点击目标连接器结束，Esc 取消，退格撤点`);
+          setStatus(`布线中：${M.endpointStr(state.design, state.drawing.from)} → 点击画布加途经点（可吸附钉/分支/拼接件），点击目标连接器或拼接件结束，Esc 取消，退格撤点`);
           refreshCanvas();
         });
       } else {
-        setStatus('请先点击一个连接器作为起点');
+        setStatus('请先点击一个连接器或拼接件作为起点');
       }
       return;
     }
-    // 布线中
-    if (n && n.type === 'connector') {
+    // 布线中：目标必须是连接器或拼接件
+    if (connectable) {
       const from = state.drawing.from;
-      showPinPicker(n, '选择终点端子', n.id === from.node ? from : null, pin => {
+      if (n.id === from.node) { setStatus('起点与终点不能是同一件，请另选目标'); return; }
+      showPinPicker(n, n.type === 'splice' ? '选择终点孔位' : '选择终点端子', null, pin => {
         finishWire(n, pin);
       });
       return;
@@ -333,7 +395,7 @@ canvas.addEventListener('pointermove', e => {
   const d = state.drag;
   if (d) {
     // 首次实际移动时才记入撤销历史，避免选择操作污染撤销栈
-    if ((d.type === 'node' || d.type === 'zone' || d.type === 'vertex') && !d.ck) {
+    if ((d.type === 'node' || d.type === 'zone' || d.type === 'vertex' || d.type === 'ep') && !d.ck) {
       checkpoint();
       d.ck = true;
     }
@@ -362,6 +424,14 @@ canvas.addEventListener('pointermove', e => {
         x: Math.min(d.x0, p.x), y: Math.min(d.y0, p.y),
         w: Math.abs(p.x - d.x0), h: Math.abs(p.y - d.y0),
       };
+      refreshCanvas();
+    }
+    // 拖接导线端
+    if (state.epDrag) {
+      state.epDrag.cur = p;
+      if (Math.hypot(p.x - state.epDrag.start.x, p.y - state.epDrag.start.y) > 4 / state.view.z) {
+        state.epDrag.moved = true;
+      }
       refreshCanvas();
     }
     return;
@@ -394,6 +464,27 @@ canvas.addEventListener('pointerup', e => {
   }
   if (d.type === 'node' || d.type === 'zone' || d.type === 'vertex') {
     refreshAll(); // 拖动结束后重算裁线表/检查
+  }
+  if (d.type === 'ep' && state.epDrag) {
+    const ed = state.epDrag;
+    state.epDrag = null;
+    const w = M.wireById(state.design, ed.wireId);
+    const target = ed.moved ? nodeAt(ed.cur) : null;
+    if (w && ed.moved) {
+      if (target && (target.type === 'connector' || target.type === 'splice')) {
+        showPinPicker(target, `把 ${w.label} 的${ed.side === 'from' ? '起' : '终'}端接到`, null, pin => {
+          w[ed.side] = { node: target.id, pin };
+          const idx = ed.side === 'from' ? 0 : w.path.length - 1;
+          w.path[idx] = { x: target.x, y: target.y, node: target.id };
+          applySpliceStrip(w, ed.side);
+          setStatus(`已把 ${w.label} ${ed.side === 'from' ? '起' : '终'}端接到 ${M.endpointStr(state.design, w[ed.side])}`);
+          refreshAll();
+        });
+      } else {
+        setStatus('请拖到连接器或拼接件上以重接该端');
+      }
+    }
+    refreshCanvas();
   }
 });
 
@@ -446,11 +537,20 @@ function finishWire(toNode, toPin) {
   const w = M.makeWire(state.design, dr.from.node, dr.from.pin);
   w.to = { node: toNode.id, pin: toPin };
   w.path = [...dr.pts, { x: toNode.x, y: toNode.y, node: toNode.id }];
+  // 落到拼接件的一端：剥线长度默认取拼接件设置
+  applySpliceStrip(w, 'from');
+  applySpliceStrip(w, 'to');
   state.design.wires.push(w);
   state.drawing = null;
   state.sel = { kind: 'wire', id: w.id };
   setStatus(`已布 ${w.label}：${M.endpointStr(state.design, w.from)} → ${M.endpointStr(state.design, w.to)}，可继续布下一根`);
   refreshAll();
+}
+
+// 若导线某端落在拼接件，按拼接件剥线长度回填
+function applySpliceStrip(w, side) {
+  const sp = M.spliceById(state.design, w[side].node);
+  if (sp) w.ends[side].strip = sp.strip;
 }
 
 // ---------- 工具与快捷键 ----------
@@ -460,20 +560,23 @@ const TOOL_HINTS = {
   connector: '点击画布放置连接器',
   branch: '点击画布放置分支点',
   nail: '点击画布放置固定钉',
+  splice: '点击画布放置拼接件（闭端/对接/超声焊）；布线时把导线端接到其孔位',
   zone: '按住拖出禁布区矩形',
-  wire: '布线：点击连接器选起点端子 → 点击途经点 → 点击目标连接器选终点端子',
+  wire: '布线：点击连接器或拼接件选起点孔位 → 点击途经点 → 点击目标选终点孔位',
 };
-function setTool(t) {
+function setTool(t, kind) {
   state.tool = t;
+  if (t === 'splice' && kind) state.spliceKind = kind;
   state.drawing = null;
   hidePinPicker();
-  document.querySelectorAll('#tools .tool').forEach(b => b.classList.toggle('active', b.dataset.tool === t));
-  canvas.classList.toggle('wiretool', t === 'wire');
-  setStatus(TOOL_HINTS[t]);
+  document.querySelectorAll('#tools .tool').forEach(b =>
+    b.classList.toggle('active', b.dataset.tool === t && (t !== 'splice' || (b.dataset.kind || 'cap') === state.spliceKind)));
+  canvas.classList.toggle('wiretool', t === 'wire' || t === 'splice');
+  setStatus(t === 'splice' ? `放置${M.spliceKind(state.spliceKind).name}：点击画布；再用布线工具把导线端拖接到孔位` : TOOL_HINTS[t]);
   refreshCanvas();
 }
 
-document.querySelectorAll('#tools .tool').forEach(b => (b.onclick = () => setTool(b.dataset.tool)));
+document.querySelectorAll('#tools .tool').forEach(b => (b.onclick = () => setTool(b.dataset.tool, b.dataset.kind)));
 $('zoomIn').onclick = () => { const r = wrap.getBoundingClientRect(); zoomAt(r.width / 2, r.height / 2, 1.25); };
 $('zoomOut').onclick = () => { const r = wrap.getBoundingClientRect(); zoomAt(r.width / 2, r.height / 2, 0.8); };
 $('zoomFit').onclick = fitView;
@@ -501,8 +604,8 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
   const k = e.key.toLowerCase();
-  const tools = { v: 'select', j: 'connector', b: 'branch', n: 'nail', z: 'zone', w: 'wire' };
-  if (tools[k]) return setTool(tools[k]);
+  const tools = { v: 'select', j: 'connector', b: 'branch', n: 'nail', z: 'zone', w: 'wire', s: 'splice' };
+  if (tools[k]) return setTool(tools[k], k === 's' ? state.spliceKind : undefined);
   if (e.key.startsWith('Arrow') && state.sel.kind === 'node') {
     const n = M.nodeById(state.design, state.sel.id);
     if (!n) return;
@@ -530,12 +633,20 @@ function deleteSelected() {
   } else if (kind === 'node') {
     const n = M.nodeById(state.design, id);
     if (!n) return;
-    if (n.type === 'connector' && state.design.wires.some(w => w.from.node === id || w.to.node === id)) {
-      return setStatus(`连接器 ${n.name} 上还有导线，请先移除相关导线`);
+    if (n.type === 'connector') {
+      const wired = state.design.wires.some(w => w.from.node === id || w.to.node === id);
+      if (wired) return setStatus(`连接器 ${n.name} 上还有导线，请先移除相关导线`);
     }
+    const spliceWires = n.type === 'splice'
+      ? state.design.wires.filter(w => w.from.node === id || w.to.node === id) : [];
     checkpoint();
     state.design.nodes = state.design.nodes.filter(x => x.id !== id);
     for (const w of state.design.wires) {
+      // 删除拼接件：其孔位上的导线端变为悬空（保留路径，端点清空），便于重新拖接
+      if (spliceWires.includes(w)) {
+        if (w.from.node === id) w.from = { node: null, pin: null };
+        if (w.to.node === id) w.to = { node: null, pin: null };
+      }
       for (const p of w.path) if (p.node === id) delete p.node; // 路径点退化为自由点
     }
   }
@@ -553,6 +664,57 @@ function renderProps() {
   if (kind === 'node') {
     const n = M.nodeById(d, id);
     if (!n) { state.sel = { kind: null, id: null }; return renderProps(); }
+
+    if (n.type === 'splice') {
+      const tname = M.spliceKind(n.kind).name;
+      const att = d.wires.reduce((a, w) => {
+        for (const side of ['from', 'to']) if (w[side].node === n.id) a.push({ w, side });
+        return a;
+      }, []);
+      const attH = att.map(x =>
+        `<span class="attchip" title="${esc(M.endpointStr(d, x.w[x.side === 'from' ? 'to' : 'from']))}">${esc(x.w.label)}#${x.w[x.side].pin}</span>`).join('');
+      el.innerHTML = `<h4>${tname} ${esc(n.name)}</h4>
+        <div class="grid2">
+          <label>名称 <input id="p-name" type="text" value="${esc(n.name)}"></label>
+          <label>类型 <select id="p-kind">${M.SPLICE_KINDS.map(k => `<option value="${k.id}" ${k.id === n.kind ? 'selected' : ''}>${k.name}</option>`).join('')}</select></label>
+          <label>孔位容量 <input id="p-ports" type="number" min="2" max="24" value="${n.ports}"></label>
+          <label>已接 ${att.length} 孔</label>
+          <label>适用最小线径 <input id="p-gmin" type="number" min="0.2" step="0.1" value="${n.gaugeMin}"></label>
+          <label>适用最大线径 <input id="p-gmax" type="number" min="0.2" step="0.1" value="${n.gaugeMax}"></label>
+          <label>剥线长度mm <input id="p-strip" type="number" min="0" step="0.5" value="${n.strip}"></label>
+          <label>X <input id="p-x" type="number" value="${n.x}"></label>
+          <label>保护套外径mm <input id="p-sd" type="number" min="0" step="0.1" value="${n.sleeveD}"></label>
+          <label>Y <input id="p-y" type="number" value="${n.y}"></label>
+          <label>保护套长度mm <input id="p-sl" type="number" min="0" step="0.5" value="${n.sleeveLen}"></label>
+        </div>
+        <div class="row"><span class="hint">接入导线：</span>${attH || '<span class="hint">（无，悬空）</span>'}</div>
+        <div class="row btns"><button id="p-del">删除拼接件（导线端转悬空）</button></div>`;
+      $('p-name').onchange = e => { checkpoint(); n.name = e.target.value.trim() || n.name; refreshAll(); };
+      $('p-kind').onchange = e => { checkpoint(); n.kind = e.target.value; refreshAll(); };
+      $('p-ports').onchange = e => {
+        const v = Math.max(2, Math.min(24, +e.target.value || 2));
+        checkpoint(); n.ports = v;
+        // 超出新容量的孔位会在校验中报端口超容
+        refreshAll();
+      };
+      $('p-gmin').onchange = e => { checkpoint(); n.gaugeMin = Math.max(0.1, +e.target.value || 0.5); refreshAll(); };
+      $('p-gmax').onchange = e => { checkpoint(); n.gaugeMax = Math.max(0.1, +e.target.value || 3); refreshAll(); };
+      $('p-strip').onchange = e => {
+        const v = Math.max(0, +e.target.value || 0);
+        checkpoint(); n.strip = v;
+        // 同步更新接到本件的导线端剥线长度
+        for (const w of d.wires) for (const side of ['from', 'to'])
+          if (w[side].node === n.id) w.ends[side].strip = v;
+        refreshAll();
+      };
+      $('p-sd').onchange = e => { checkpoint(); n.sleeveD = Math.max(0, +e.target.value || 0); refreshAll(); };
+      $('p-sl').onchange = e => { checkpoint(); n.sleeveLen = Math.max(0, +e.target.value || 0); refreshAll(); };
+      $('p-x').onchange = e => { checkpoint(); n.x = +e.target.value || 0; refreshAll(); };
+      $('p-y').onchange = e => { checkpoint(); n.y = +e.target.value || 0; refreshAll(); };
+      $('p-del').onclick = deleteSelected;
+      return;
+    }
+
     const tname = { connector: '连接器', branch: '分支点', nail: '固定钉' }[n.type];
     el.innerHTML = `<h4>${tname} ${esc(n.name)}</h4>
       <div class="grid2">
@@ -595,11 +757,15 @@ function renderProps() {
     const w = M.wireById(d, id);
     if (!w) { state.sel = { kind: null, id: null }; return renderProps(); }
     const c = M.cutInfo(d, w);
-    const conns = d.nodes.filter(n => n.type === 'connector');
-    const connOpts = sel => conns.map(n => `<option value="${n.id}" ${n.id === sel ? 'selected' : ''}>${esc(n.name)}</option>`).join('');
+    const conns = d.nodes.filter(n => n.type === 'connector' || n.type === 'splice');
+    const connOpts = sel => conns.map(n => {
+      const tag = n.type === 'splice' ? `〔${M.spliceKind(n.kind).short}〕` : '';
+      return `<option value="${n.id}" ${n.id === sel ? 'selected' : ''}>${tag}${esc(n.name)}</option>`;
+    }).join('');
     const pinOpts = (nodeId, sel) => {
       const n = M.nodeById(d, nodeId);
-      const m = n ? (n.pins || 4) : 0;
+      if (!n) return '';
+      const m = n.type === 'splice' ? Math.max(2, n.ports || 4) : (n.pins || 4);
       let h = '';
       for (let i = 1; i <= m; i++) h += `<option ${i === sel ? 'selected' : ''}>${i}</option>`;
       return h;
@@ -612,9 +778,9 @@ function renderProps() {
       <div class="row"><span>颜色</span><span class="swatch" id="w-color">${M.WIRE_COLORS.map(([c, nm]) => `<button data-c="${c}" title="${nm}" class="${c === w.color ? 'cur' : ''}" style="background:${c}"></button>`).join('')}</span></div>
       <div class="grid2">
         <label>起点 <select id="w-from-node">${connOpts(w.from.node)}</select></label>
-        <label>端子 <select id="w-from-pin">${pinOpts(w.from.node, w.from.pin)}</select></label>
+        <label>端子/孔 <select id="w-from-pin">${pinOpts(w.from.node, w.from.pin)}</select></label>
         <label>终点 <select id="w-to-node">${connOpts(w.to.node)}</select></label>
-        <label>端子 <select id="w-to-pin">${pinOpts(w.to.node, w.to.pin)}</select></label>
+        <label>端子/孔 <select id="w-to-pin">${pinOpts(w.to.node, w.to.pin)}</select></label>
       </div>
       <div class="sub">端头处理（起 / 讫）</div>
       <div class="grid2">
@@ -639,6 +805,7 @@ function renderProps() {
       const n = M.nodeById(d, nodeId);
       const idx = side === 'from' ? 0 : w.path.length - 1;
       if (n) w.path[idx] = { x: n.x, y: n.y, node: nodeId };
+      applySpliceStrip(w, side);
       refreshAll();
     };
     $('w-from-node').onchange = () => { const sel = $('w-from-pin'); sel.innerHTML = pinOpts($('w-from-node').value, 1); rebind('from'); };
@@ -671,7 +838,7 @@ function renderProps() {
       <label>绑扎间距mm <input id="s-tsp" type="number" min="20" value="${s.tieSpacing}"></label>
       <label>分支绑扎偏移 <input id="s-toff" type="number" min="1" value="${s.tieOffset}"></label>
     </div>
-    <p class="hint">共 ${d.nodes.length} 个节点、${d.wires.length} 根导线、${d.zones.length} 个禁布区。点击画布对象可编辑其属性。</p>`;
+    <p class="hint">共 ${d.nodes.filter(n=>n.type==='connector').length} 个连接器、${d.nodes.filter(n=>n.type==='splice').length} 个拼接件、${d.wires.length} 根导线、${d.zones.length} 个禁布区。点击画布对象可编辑其属性。</p>`;
   const bind = (id, fn) => ($(id).onchange = e => { checkpoint(); fn(+e.target.value); refreshAll(); });
   bind('b-w', v => { b.width = Math.max(100, v || 100); });
   bind('b-h', v => { b.height = Math.max(100, v || 100); });
@@ -746,7 +913,23 @@ function renderCuts() {
       <td>${r.path.toFixed(0)}</td><td>${r.svc}</td><td>${r.stripFrom}/${r.stripTo}</td>
       <td>${r.cut.toFixed(0)}</td><td><b>${r.rounded}</b></td></tr>`;
   }
-  h += `</tbody></table><h4>用料汇总（按建议裁线）</h4><table class="list"><thead><tr><th class="l">线径</th><th class="l">颜色</th><th>根数</th><th>总长</th></tr></thead><tbody>`;
+  h += `</tbody></table>`;
+  const spl = M.spliceList(state.design);
+  if (spl.length) {
+    h += `<h4>拼接件（集线→压接→套管）</h4><table class="list"><thead><tr>
+      <th class="l">拼接件</th><th class="l">类型</th><th>孔位/已接</th><th class="l">适用/实配</th>
+      <th>剥线</th><th>保护套</th><th class="l">接入线号#孔</th></tr></thead><tbody>`;
+    for (const s of spl) {
+      const wires = s.wires.map(x => `${x.wire.label}#${x.pin}`).join('、');
+      h += `<tr data-sp="${s.id}" style="cursor:pointer">
+        <td class="l"><b>${esc(s.name)}</b></td><td class="l">${esc(s.kindName)}</td>
+        <td>${s.ports}/${s.count}</td><td class="l">⌀${s.gaugeMin}~⌀${s.gaugeMax}｜${esc(s.gaugeRange)}</td>
+        <td>${s.strip}</td><td>${s.sleeveD ? '⌀' + s.sleeveD + '×' + s.sleeveLen : '—'}</td>
+        <td class="l">${esc(wires)}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+  }
+  h += `<h4>用料汇总（按建议裁线）</h4><table class="list"><thead><tr><th class="l">线径</th><th class="l">颜色</th><th>根数</th><th>总长</th></tr></thead><tbody>`;
   for (const g of M.materialSummary(state.design)) {
     g.colors.forEach((c, i) => {
       h += `<tr>${i === 0 ? `<td class="l" rowspan="${g.colors.length}">⌀${g.gauge}mm</td>` : ''}
@@ -757,6 +940,12 @@ function renderCuts() {
   h += `</tbody></table><p class="hint">裁线长 = 路径长 + 两端维修余量 + 两端剥线；建议值按设定向上取整。</p>`;
   el.innerHTML = h;
   $('csvBtn').onclick = () => IO.download(state.design.name + '-裁线表.csv', IO.cutListCSV(state.design), 'text/csv;charset=utf-8');
+  el.querySelectorAll('tr[data-sp]').forEach(tr => (tr.onclick = () => {
+    state.sel = { kind: 'node', id: tr.dataset.sp };
+    const n = M.nodeById(state.design, tr.dataset.sp);
+    if (n) centerOn(n);
+    refreshAll();
+  }));
   el.querySelectorAll('tr[data-w]').forEach(tr => (tr.onclick = () => {
     state.sel = { kind: 'wire', id: tr.dataset.w };
     const w = M.wireById(state.design, tr.dataset.w);
@@ -786,27 +975,40 @@ function renderAsm() {
   const order = M.assemblyOrder(state.design);
   if (!order.length) { el.innerHTML = '<p class="hint">尚未布线。</p>'; return; }
   const st = state.step;
+  const steps = st ? st.steps : M.assemblySteps(state.design, new Set());
   let h = `<div class="row btns">
     ${st && st.active
       ? `<button id="asmStop">退出逐步推演</button>`
-      : `<button id="asmStart" ${order.length ? '' : 'disabled'}>开始逐步推演</button>
-         <label class="chk"><input type="checkbox" id="asmLock" checked> 确认后锁定</label>`}
+      : `<button id="asmStart">开始逐步推演</button>
+         <label class="chk"><input type="checkbox" id="asmLock" checked> 送线确认后锁定</label>`}
     <button id="asmTidy" title="移除共线冗余点并吸附就近节点，锁定导线不受影响">重排未锁定路径</button>
   </div>`;
-  h += '<div>' + order.map((o, i) => {
-    const w = M.wireById(state.design, o.wireId);
-    const cls = st && st.active
-      ? (st.confirmed.has(o.wireId) ? 'done' : st.order[st.idx] === o.wireId ? 'cur' : '')
-      : '';
-    return `<div class="asmitem ${cls}" data-w="${o.wireId}">
-      <span class="no">${i + 1}</span>
-      <span class="colorchip" style="background:${w ? w.color : '#999'}"></span>
-      <span>${esc(o.label)}${o.locked ? ' 🔒' : ''}</span>
-      <span style="color:#777">${o.length.toFixed(0)}mm</span>
-      <span style="color:#999;font-size:11px">主干 ${o.shared.toFixed(0)}mm</span>
-    </div>`;
+  h += '<div>' + steps.map((s, i) => {
+    let cls = '', body = '';
+    if (st && st.active) {
+      if (s.kind === 'wire') cls = st.confirmed.has(s.wireId) ? 'done' : st.idx === i ? 'cur' : '';
+      else cls = st.spliceDone.has(s.spliceId) ? 'done' : st.idx === i ? 'cur' : '';
+    }
+    if (s.kind === 'wire') {
+      const w = M.wireById(state.design, s.wireId);
+      body = `<span class="no">${i + 1}</span>
+        <span class="colorchip" style="background:${w ? w.color : '#999'}"></span>
+        <span class="asmname">${esc(s.label)}${s.locked ? ' 🔒' : ''}</span>
+        <span style="color:#777">${s.length.toFixed(0)}mm</span>
+        <span style="color:#999;font-size:11px">主干 ${s.shared.toFixed(0)}mm</span>`;
+    } else {
+      const kd = M.spliceKind(s.splice.kind);
+      const live = s.attaches.filter(a => st.confirmed.has(a.wire.id)).length;
+      const ready = s.count >= 2 && live === s.count;
+      body = `<span class="no">${i + 1}</span>
+        <span class="splicetag">${kd.short}</span>
+        <span class="asmname">${esc(s.label)}（集线→压接→套管）</span>
+        <span style="color:#${ready ? '2e7d32' : 'c62828'};font-size:11px">${live}/${s.count} 线就位</span>`;
+    }
+    const dataAttr = s.kind === 'wire' ? `data-w="${s.wireId}"` : `data-sp="${s.spliceId}"`;
+    return `<div class="asmitem ${cls}" ${dataAttr}>${body}</div>`;
   }).join('') + '</div>';
-  h += '<p class="hint">顺序按“主干优先”排列：与其它导线重合段越长、自身越长的先敷设。</p>';
+  h += '<p class="hint">先逐根送线（主干优先），再按拼接件引导集线、压接、套管确认；拼接件未接齐不得完成。</p>';
   el.innerHTML = h;
   if (st && st.active) $('asmStop').onclick = stopStep;
   else {
@@ -820,20 +1022,27 @@ function renderAsm() {
     refreshAll();
   };
   el.querySelectorAll('.asmitem').forEach(div => (div.onclick = () => {
-    state.sel = { kind: 'wire', id: div.dataset.w };
+    if (div.dataset.w) state.sel = { kind: 'wire', id: div.dataset.w };
+    else if (div.dataset.sp) state.sel = { kind: 'node', id: div.dataset.sp };
     refreshAll();
   }));
 }
 
 function startStep() {
-  const order = M.assemblyOrder(state.design).map(o => o.wireId);
-  if (!order.length) return;
+  const confirmed = new Set(state.design.wires.filter(w => w.locked).map(w => w.id));
+  const steps = M.assemblySteps(state.design, confirmed);
+  if (!steps.some(s => s.kind === 'wire')) return;
   checkpoint(); // 推演中的锁定可一次撤销
-  state.step = { active: true, order, idx: 0, confirmed: new Set(), lock: $('asmLock') ? $('asmLock').checked : true };
+  state.step = {
+    active: true, steps, idx: 0,
+    confirmed, spliceDone: new Set(),
+    locks: new Set(state.design.wires.filter(w => w.locked).map(w => w.id)),
+    lock: $('asmLock') ? $('asmLock').checked : true,
+  };
   setTool('select');
-  state.sel = { kind: 'wire', id: order[0] };
+  selectStep(0);
   $('stepBar').classList.remove('hidden');
-  setStatus('逐步推演：核对当前导线与固定钉，确认后才推进');
+  setStatus('逐步推演：先逐根送线，再按拼接件集线/压接/套管确认');
   refreshAll();
 }
 function stopStep() {
@@ -842,44 +1051,105 @@ function stopStep() {
   setStatus('已退出逐步推演');
   refreshAll();
 }
+function selectStep(i) {
+  const st = state.step;
+  st.idx = Math.max(0, Math.min(st.steps.length - 1, i));
+  const s = st.steps[st.idx];
+  if (s.kind === 'wire') {
+    state.sel = { kind: 'wire', id: s.wireId };
+    const w = M.wireById(state.design, s.wireId);
+    if (w) { const pts = M.resolvePath(state.design, w); centerOn(pts[Math.floor(pts.length / 2)]); }
+  } else {
+    state.sel = { kind: 'node', id: s.spliceId };
+    centerOn(s.splice);
+  }
+}
 function renderStepBar() {
   const st = state.step;
   const bar = $('stepBar');
   if (!st || !st.active) { bar.classList.add('hidden'); return; }
   const d = state.design;
-  const wid = st.order[st.idx];
-  const w = M.wireById(d, wid);
-  if (!w) { stopStep(); return; }
-  const c = M.cutInfo(d, w);
-  const nails = M.resolvePath(d, w).filter(p => p.node).map(p => M.nodeName(d, p.node));
-  bar.innerHTML = `<span class="prog">第 ${st.idx + 1}/${st.order.length} 根</span>
-    <span class="cur"><span class="colorchip" style="background:${w.color}"></span> ${esc(w.label)}</span>
-    <span>${esc(M.endpointStr(d, w.from))} → ${esc(M.endpointStr(d, w.to))} · ⌀${w.gauge} · 裁线 ${c.rounded}mm</span>
-    <span style="color:#666">途经：${nails.map(esc).join(' → ')}</span>
-    <button id="stPrev" ${st.idx === 0 ? 'disabled' : ''}>上一步</button>
-    <button id="stOk">确认并推进</button>
-    <button id="stExit">退出</button>`;
-  $('stPrev').onclick = () => { st.idx = Math.max(0, st.idx - 1); state.sel = { kind: 'wire', id: st.order[st.idx] }; refreshAll(); };
-  $('stOk').onclick = () => {
-    st.confirmed.add(wid);
-    if (st.lock) w.locked = true;
-    st.idx++;
-    if (st.idx >= st.order.length) {
-      stopStep();
-      setStatus(`推演完成：${st.confirmed.size} 根导线已确认${st.lock ? '并锁定' : ''}`);
-      return;
-    }
-    state.sel = { kind: 'wire', id: st.order[st.idx] };
-    refreshAll();
-  };
-  $('stExit').onclick = stopStep;
+  const s = st.steps[st.idx];
+  if (!s) { stopStep(); return; }
+
+  if (s.kind === 'wire') {
+    const w = M.wireById(d, s.wireId);
+    if (!w) { stopStep(); return; }
+    const c = M.cutInfo(d, w);
+    const nails = M.resolvePath(d, w).filter(p => p.node).map(p => M.nodeName(d, p.node));
+    bar.innerHTML = `<span class="prog">送线 第 ${st.idx + 1}/${st.steps.length} 步</span>
+      <span class="cur"><span class="colorchip" style="background:${w.color}"></span> ${esc(w.label)}</span>
+      <span>${esc(M.endpointStr(d, w.from))} → ${esc(M.endpointStr(d, w.to))} · ⌀${w.gauge} · 裁线 ${c.rounded}mm</span>
+      <span style="color:#666">途经：${nails.map(esc).join(' → ')}</span>
+      <button id="stPrev" ${st.idx === 0 ? 'disabled' : ''}>上一步</button>
+      <button id="stOk">确认送线并推进</button>
+      <button id="stExit">退出</button>`;
+    $('stOk').onclick = () => {
+      st.confirmed.add(w.id);
+      if (st.lock) w.locked = true;
+      advance();
+    };
+  } else {
+    const sp = s.splice;
+    const kd = M.spliceKind(sp.kind);
+    // 实时重算就位情况（导线可能在本步骤之前刚确认）
+    s.doneWires = s.attaches.filter(a => st.confirmed.has(a.wire.id)).length;
+    s.ready = s.count >= 2 && s.doneWires === s.count;
+    if (st.phaseStep !== st.idx) { st.phase = 0; st.phaseStep = st.idx; }
+    const issues = M.validate(d).filter(i => i.node === sp.id && i.level === 'error');
+    const labels = s.attaches.map(a =>
+      `${a.wire.label}#${a.wire[a.side].pin}（⌀${a.wire.gauge}）`).join('、');
+    const sleeve = sp.sleeveD > 0 ? `⌀${sp.sleeveD}×${sp.sleeveLen}mm` : '无套管';
+    bar.innerHTML = `<span class="prog">拼接 第 ${st.idx + 1}/${st.steps.length} 步</span>
+      <span class="cur">${kd.glyph} ${kd.name} ${esc(sp.name)}</span>
+      <span style="color:#${s.ready ? '2e7d32' : 'c62828'}">就位 ${s.doneWires}/${s.count} 根</span>
+      <span style="color:#666">孔位：${esc(labels)} · 剥线${sp.strip}mm · 套${esc(sleeve)}</span>
+      <button id="stPrev" ${st.idx === 0 ? 'disabled' : ''}>上一步</button>
+      <button id="stGather">集线确认</button>
+      <button id="stCrimp">压接确认</button>
+      <button id="stSleeve">套管确认</button>
+      <button id="stOk" ${s.ready && !issues.length ? '' : 'disabled'} title="${issues.length ? '该拼接件存在校验错误' : '导线未接齐'}">完成拼接并推进</button>
+      <button id="stExit">退出</button>`;
+    $('stGather').onclick = () => { st.phase = Math.max(st.phase || 0, 1); setStatus(`已集线：核对 ${labels}`); };
+    $('stCrimp').onclick = () => {
+      if ((st.phase || 0) < 1) return setStatus('请先确认集线');
+      st.phase = 2; setStatus(`${sp.name} 已${sp.kind === 'ultra' ? '超声焊接' : '压接'}`);
+    };
+    $('stSleeve').onclick = () => {
+      if ((st.phase || 0) < 2) return setStatus('请先确认压接');
+      st.phase = 3; setStatus(sp.sleeveD > 0 ? `保护套已就位（${sleeve}），热缩确认` : '该件无保护套，确认完成');
+    };
+    $('stOk').onclick = () => {
+      if (!s.ready || issues.length) { setStatus('未接齐或存在校验错误，不得完成拼接'); return; }
+      st.spliceDone.add(sp.id);
+      st.phase = 0;
+      advance();
+    };
+  }
+  const prev = $('stPrev');
+  if (prev) prev.onclick = () => selectStep(st.idx - 1);
+  const ex = $('stExit'); if (ex) ex.onclick = stopStep;
+}
+function advance() {
+  const st = state.step;
+  selectStep(st.idx + 1);
+  const cur = st.steps[st.idx];
+  const done = cur.kind === 'wire' ? st.confirmed.has(cur.wireId) : st.spliceDone.has(cur.spliceId);
+  if (done) {
+    const ns = st.steps.filter(s => s.kind === 'splice').length;
+    stopStep();
+    setStatus(`装配推演完成：${st.confirmed.size} 根导线已送线确认，${ns} 个拼接件已集线/压接/套管确认`);
+    return;
+  }
+  refreshAll();
 }
 
 // ---------- 数据面板 ----------
 
 function syncDataPanel() {
   $('designName').value = state.design.name;
-  $('netlist').value = state.design.nets.map(n => `${n.label} ${n.from} ${n.to}`).join('\n');
+  $('netlist').value = M.normalizeNets(state.design.nets)
+    .map(n => [n.name, ...n.endpoints].join(' ')).join('\n');
 }
 
 async function refreshSaveList() {
@@ -961,19 +1231,25 @@ $('labelsBtn').onclick = () => {
 };
 $('netsApply').onclick = () => {
   const lines = $('netlist').value.split('\n').map(s => s.trim()).filter(Boolean);
-  const nets = [], bad = [];
+  const byName = new Map();
+  const bad = [];
   for (const ln of lines) {
-    const parts = ln.split(/[\s,，]+/).filter(Boolean);
-    if (parts.length !== 3 || !M.parseEndpoint(parts[1]) || !M.parseEndpoint(parts[2])) {
-      bad.push(ln);
-      continue;
-    }
-    nets.push({ label: parts[0], from: parts[1], to: parts[2] });
+    const parts = ln.split(/[\s,，→]+/).filter(Boolean);
+    if (parts.length < 3) { bad.push(ln); continue; }
+    const name = parts[0];
+    const eps = parts.slice(1);
+    if (!eps.every(M.parseEndpoint)) { bad.push(ln); continue; }
+    // 同一网络名出现多行即合并；旧格式 线号 起 讫 同样兼容
+    if (!byName.has(name)) byName.set(name, []);
+    const list = byName.get(name);
+    for (const ep of eps) if (!list.includes(ep)) list.push(ep);
   }
   checkpoint();
-  state.design.nets = nets;
+  state.design.nets = [...byName.entries()].map(([name, endpoints]) => ({ name, endpoints }));
   refreshAll();
-  setStatus(bad.length ? `接线表已应用，${bad.length} 行无法解析：${bad[0]}` : `接线表已应用（${nets.length} 条）`);
+  setStatus(bad.length
+    ? `接线表已应用，${bad.length} 行无法解析：${bad[0]}`
+    : `接线表已应用（${state.design.nets.length} 个网络）`);
 };
 $('netsAuto').onclick = () => {
   checkpoint();

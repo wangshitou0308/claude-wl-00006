@@ -176,14 +176,18 @@ async function doArchive() {
 function renderNets() {
   const cur = state.current;
   const testing = cur.batch.status === 'testing';
-  $('netList').innerHTML = state.analysis.coverage.map(c => `
+  $('netList').innerHTML = state.analysis.coverage.map(c => {
+    const sp = cur.snapshot.nets.find(n => n.id === c.net);
+    const via = sp && sp.splices && sp.splices.length ? ` <span class="viasp">🔗 ${esc(sp.splices.join('、'))}</span>` : '';
+    return `
     <div class="netitem ${c.covered ? 'done' : ''}">
-      <div><b>${esc(c.net)}</b> ${esc(c.label)} ${c.covered ? '✓' : ''}</div>
+      <div><b>${esc(c.net)}</b> ${esc(c.label)} ${c.covered ? '✓' : ''}${via}</div>
       <div class="eps">${c.endpoints.map(esc).join(' · ')}</div>
       <div class="prog"><span>已测 ${c.measured}/${c.needed}</span>
         ${testing ? `<button data-retest="${esc(c.net)}" title="撤回该网络全部有效读数后重新测量">重测</button>` : ''}
       </div>
-    </div>`).join('') || '<p class="hint">快照中没有网络。</p>';
+    </div>`;
+  }).join('') || '<p class="hint">快照中没有网络。</p>';
   $('netList').querySelectorAll('[data-retest]').forEach(btn => (btn.onclick = async () => {
     if (!confirm(`重测 ${btn.dataset.retest}：该网络现有读数将被撤回，继续？`)) return;
     try {
@@ -584,7 +588,19 @@ function printSheet() {
   const covMap = new Map(an.coverage.map(c => [c.net, c]));
   const netRows = snap.nets.map(n => {
     const c = covMap.get(n.id);
-    return `<tr><td>${esc(n.id)}</td><td>${esc(n.label)}</td><td>${n.endpoints.map(esc).join(' · ')}</td><td>${c && c.covered ? '已覆盖' : '未覆盖'}</td></tr>`;
+    const via = n.splices && n.splices.length ? `（经拼接 ${n.splices.join('、')}）` : '';
+    return `<tr><td>${esc(n.id)}</td><td>${esc(n.label)}</td><td>${n.endpoints.map(esc).join(' · ')}${via}</td><td>${c && c.covered ? '已覆盖' : '未覆盖'}</td></tr>`;
+  }).join('');
+  // 拼接拓扑快照
+  const spl = snap.splices || [];
+  const splRows = spl.map(s => {
+    const used = new Set();
+    snap.nets.forEach(n => (n.splices || []).includes(s.name) && n.endpoints.forEach(e => used.add(e)));
+    const kindName = { cap: '闭端', butt: '对接', ultra: '超声焊' }[s.kind] || s.kind;
+    return `<tr><td>${esc(s.name)}</td><td>${esc(kindName)}</td><td>${s.ports} 孔</td>
+      <td>⌀${s.gauge_min}~⌀${s.gauge_max}</td><td>${s.strip}</td>
+      <td>${s.sleeve_d ? '⌀' + s.sleeve_d + '×' + s.sleeve_len : '—'}</td>
+      <td>${[...used].map(esc).join(' · ')}</td></tr>`;
   }).join('');
   const readRows = cur.readings.map(r => `<tr${r.withdrawn ? ' class="wd"' : ''}>
     <td>${r.id}</td><td>${esc(r.created_at).replace('T', ' ')}</td><td>${esc(r.a)}</td><td>${esc(r.b)}</td>
@@ -605,11 +621,14 @@ function printSheet() {
     创建：${esc(b.created_at).replace('T', ' ')}　更新：${esc(b.updated_at).replace('T', ' ')}<br>
     读数 ${an.stats.readings}（撤回 ${an.stats.withdrawn}）　网络覆盖 ${an.stats.covered}/${an.stats.nets}　未决异常 ${an.stats.unresolved}</p>
     <h3>一、网络与针位</h3>
-    <table><thead><tr><th>网络</th><th>线号</th><th>针位</th><th>覆盖</th></tr></thead><tbody>${netRows}</tbody></table>
-    <h3>二、实测读数</h3>
+    <table><thead><tr><th>网络</th><th>线号</th><th>针位（拼接拓扑）</th><th>覆盖</th></tr></thead><tbody>${netRows}</tbody></table>
+    ${splRows ? `<h3>二、实体拼接件</h3>
+    <table><thead><tr><th>拼接件</th><th>类型</th><th>容量</th><th>适用线径</th><th>剥线mm</th><th>保护套mm</th><th>连通端子</th></tr></thead>
+    <tbody>${splRows}</tbody></table>` : ''}
+    <h3>${splRows ? '三' : '二'}、实测读数</h3>
     <table><thead><tr><th>#</th><th>时间</th><th>测点 A</th><th>测点 B</th><th>结果</th><th>阻值</th><th>极性</th><th>检验人</th><th>来源</th><th>备注</th></tr></thead>
     <tbody>${readRows || '<tr><td colspan="10">（无）</td></tr>'}</tbody></table>
-    <h3>三、异常与处置记录</h3>
+    <h3>${splRows ? '四' : '三'}、异常与处置记录</h3>
     <table><thead><tr><th>类型</th><th>说明</th><th>状态</th><th>处置记录</th></tr></thead>
     <tbody>${anomRows || '<tr><td colspan="4">（无异常）</td></tr>'}</tbody></table>
     <p class="sign">检验：＿＿＿＿＿＿　复核：＿＿＿＿＿＿　日期：＿＿＿＿＿＿</p>`);

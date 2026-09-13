@@ -89,7 +89,10 @@ class _UF:
 # ---------- 快照 ----------
 
 def build_snapshot(design, design_id=None, design_name=None):
-    """从钉板方案构建检验快照：连接器、端子（针位）与接线网络（导线端点并查集）。"""
+    """从钉板方案构建检验快照：连接器、端子（针位）与接线网络。
+
+    导线两端可落在连接器端子或拼接件孔位；同一拼接件的所有孔位内部导通，
+    因此沿“导线 + 拼接件”用并查集追踪多分支网络，保留拼接拓扑（splices）。"""
     nodes = design.get('nodes') or []
     wires = design.get('wires') or []
     conns = [n for n in nodes if n.get('type') == 'connector']
@@ -106,8 +109,25 @@ def build_snapshot(design, design_id=None, design_name=None):
     } for c in conns]
     by_id = {n.get('id'): n for n in nodes}
 
+    # 拼接件拓扑：每个孔位 → 连接器端子（经一根导线）
+    splices = []
+    splice_port_term = {}   # (splice_id, pin) -> 连接器端子
+    splice_wire = {}        # wire_id -> splice_id
+    for sp in nodes:
+        if sp.get('type') != 'splice':
+            continue
+        ports = max(2, int(sp.get('ports') or 4))
+        splices.append({
+            'id': sp.get('id'), 'name': str(sp.get('name')),
+            'kind': str(sp.get('kind') or 'cap'), 'ports': ports,
+            'gauge_min': sp.get('gaugeMin', 0.5), 'gauge_max': sp.get('gaugeMax', 5),
+            'strip': sp.get('strip', 7),
+            'sleeve_d': sp.get('sleeveD', 0), 'sleeve_len': sp.get('sleeveLen', 0),
+        })
+
     uf = _UF()
     links = []  # (端点A, 端点B, 线号)
+    wire_terms = {}  # wire_id -> [from_term or None, to_term or None]
     for w in wires:
         eps = []
         for side in ('from', 'to'):
@@ -118,29 +138,60 @@ def build_snapshot(design, design_id=None, design_name=None):
                 eps.append('%s.%d' % (node.get('name'), pin))
             else:
                 eps.append(None)
+        wire_terms[w.get('id')] = eps
         a, b = eps
-        if not a or not b or a == b:
-            continue
-        uf.union(a, b)
-        links.append((a, b, str(w.get('label') or '')))
-    if not links:
+        if a and b and a != b:
+            uf.union(a, b)
+            links.append((a, b, str(w.get('label') or '')))
+
+    # 拼接件：把同件各孔所连导线的对侧连接器端子全部并起来
+    for sp in splices:
+        sid = sp['id']
+        terms = set()
+        for w in wires:
+            for i, side in enumerate(('from', 'to')):
+                ep = w.get(side) or {}
+                if ep.get('node') != sid:
+                    continue
+                pin = ep.get('pin')
+                opp = wire_terms.get(w.get('id'))
+                if opp:
+                    t = opp[1 - i]  # 对侧连接器端子
+                    if t:
+                        terms.add(t)
+                        splice_port_term[(sid, pin)] = t
+                        splice_wire[w.get('id')] = sid
+        terms = list(terms)
+        for t in terms[1:]:
+            uf.union(terms[0], t)
+
+    if not links and not splice_port_term:
         raise ValueError('方案中没有已连接的导线')
 
     groups = {}
     labels = {}
+    all_terms = set()
+    for a, b, lb in links:
+        all_terms.update((a, b))
+    all_terms.update(splice_port_term.values())
+    for t in all_terms:
+        root = uf.find(t)
+        groups.setdefault(root, set()).add(t)
     for a, b, lb in links:
         root = uf.find(a)
-        groups.setdefault(root, set()).update((a, b))
         if lb:
             lst = labels.setdefault(root, [])
             if lb not in lst:
                 lst.append(lb)
     nets = []
     for i, root in enumerate(sorted(groups, key=lambda r: sort_endpoints(groups[r])[0])):
+        members = sort_endpoints(groups[root])
+        via = sorted({sid for (sid, _pin), t in splice_port_term.items() if t in groups[root]})
         nets.append({
             'id': 'NET%d' % (i + 1),
             'label': '/'.join(labels.get(root, [])) or ('网络%d' % (i + 1)),
-            'endpoints': sort_endpoints(groups[root]),
+            'endpoints': members,
+            'splices': [next((s['name'] for s in splices if s['id'] == sid), sid) for sid in via],
         })
     terminals = []
     for c in connectors:
@@ -151,6 +202,7 @@ def build_snapshot(design, design_id=None, design_name=None):
         'design_name': design_name or '',
         'connectors': connectors,
         'terminals': terminals,
+        'splices': splices,
         'nets': nets,
     }
 

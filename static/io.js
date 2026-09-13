@@ -3,7 +3,7 @@
 
 import {
   resolvePath, computeBundles, cutList, materialSummary, tieList,
-  nodeName, endpointStr, polyLen,
+  nodeName, endpointStr, polyLen, spliceList, spliceKind, migrateDesign,
 } from './model.js';
 import { esc } from './render.js';
 
@@ -64,8 +64,7 @@ export function readJSONFile(file) {
       try {
         const d = JSON.parse(fr.result);
         if (!d || !Array.isArray(d.nodes) || !Array.isArray(d.wires)) throw new Error('不是有效的线束设计文件');
-        d.zones = d.zones || []; d.nets = d.nets || [];
-        resolve(d);
+        resolve(migrateDesign(d));
       } catch (e) { reject(e); }
     };
     fr.onerror = () => reject(new Error('文件读取失败'));
@@ -76,13 +75,26 @@ export function readJSONFile(file) {
 // ---------- CSV ----------
 
 export function cutListCSV(design) {
-  const rows = [['线号', '颜色', '线径mm', '起点', '终点', '路径长mm', '维修余量mm', '剥线mm', '裁线长mm', '建议裁线mm', '压接(起)', '压接(讫)']];
+  const rows = [['线号', '颜色', '线径mm', '起点', '终点', '路径长mm', '维修余量mm', '剥线mm', '裁线长mm', '建议裁线mm', '压接(起)', '压接(讫)', '拼接(起)', '拼接(讫)', '保护套(起)', '保护套(讫)']];
   for (const r of cutList(design)) {
     rows.push([
       r.label, r.color, r.gauge, r.from, r.to,
       r.path.toFixed(1), r.svc, r.strip, r.cut.toFixed(1), r.rounded,
       r.crimpFrom || '', r.crimpTo || '',
+      r.spliceFrom || '', r.spliceTo || '', r.sleeveFrom || '', r.sleeveTo || '',
     ]);
+  }
+  const spl = spliceList(design);
+  if (spl.length) {
+    rows.push([]);
+    rows.push(['拼接件', '类型', '孔位/已接', '适用线径', '剥线mm', '保护套外径mm', '保护套长度mm', '接入线号']);
+    for (const s of spl) {
+      rows.push([
+        s.name, s.kindName, `${s.ports}/${s.count}`, `⌀${s.gaugeMin}~⌀${s.gaugeMax}`,
+        s.strip, s.sleeveD || '', s.sleeveLen || '',
+        s.wires.map(x => x.wire.label + '#' + x.pin).join(' '),
+      ]);
+    }
   }
   return '﻿' + rows.map(r => r.join(',')).join('\r\n');
 }
@@ -139,6 +151,24 @@ function printContent(design) {
       const w = Math.max(34, (n.pins || 4) * 7 + 12), hh = 18;
       h += `<rect x="${n.x - w / 2}" y="${n.y - hh / 2}" width="${w}" height="${hh}" fill="none" stroke="#000" stroke-width="0.5"/>
             <text x="${n.x}" y="${n.y - hh / 2 - 2}" font-size="5" font-weight="bold" text-anchor="middle">${esc(n.name)}</text>`;
+    } else if (n.type === 'splice') {
+      const ports = Math.max(2, n.ports || 4);
+      const w = Math.max(18, ports * 6 + 8);
+      const kind = spliceKind(n.kind);
+      if (n.kind === 'cap') {
+        h += `<path d="M ${n.x - w / 2 + 3} ${n.y + 4} L ${n.x - w / 2 + 1} ${n.y - 3} L ${n.x + w / 2 - 1} ${n.y - 3} L ${n.x + w / 2 - 3} ${n.y + 4} Z"
+              fill="none" stroke="#000" stroke-width="0.5"/>`;
+      } else if (n.kind === 'butt') {
+        h += `<rect x="${n.x - w / 2 + 1}" y="${n.y - 5}" width="${w - 2}" height="8" rx="1.5" fill="none" stroke="#000" stroke-width="0.5"/>
+              <line x1="${n.x}" y1="${n.y - 5}" x2="${n.x}" y2="${n.y + 3}" stroke="#000" stroke-width="0.4"/>`;
+      } else {
+        h += `<rect x="${n.x - w / 2 + 1}" y="${n.y - 5.5}" width="${w - 2}" height="9.5" rx="2" fill="none" stroke="#000" stroke-width="0.5"/>`;
+      }
+      for (let i = 1; i <= ports; i++) {
+        const px = n.x - w / 2 + ((i - 0.5) / ports) * w;
+        h += `<circle cx="${px}" cy="${n.y + 6.5}" r="1.1" fill="none" stroke="#000" stroke-width="0.3"/>`;
+      }
+      h += `<text x="${n.x}" y="${n.y - 8}" font-size="4.2" font-weight="bold" text-anchor="middle">${esc(kind.short)}${esc(n.name)}</text>`;
     } else if (n.type === 'branch') {
       h += `<rect x="${n.x - 4}" y="${n.y - 4}" width="8" height="8" transform="rotate(45 ${n.x} ${n.y})" fill="none" stroke="#000" stroke-width="0.5"/>
             <text x="${n.x}" y="${n.y - 7}" font-size="4" text-anchor="middle">${esc(n.name)}</text>`;
@@ -174,8 +204,40 @@ export function openPrintTemplate(design) {
   </svg>
 </div>`;
   });
-  openPrintWindow(design.name + ' - 打印模板', pages, 'A4 landscape');
+  openPrintWindow(design.name + ' - 打印模板', pages + spliceTablePage(design), 'A4 landscape');
   return tiles.length;
+}
+
+// 拼接件下料与工艺表（保留拼接拓扑：孔位、线径、剥线、保护套、接入线号）
+function spliceTablePage(design) {
+  const spl = spliceList(design);
+  if (!spl.length) return '';
+  const rows = spl.map(s => {
+    const wires = s.wires.map(x =>
+      `${esc(x.wire.label)}→${esc(endpointStr(design, x.wire[x.side === 'from' ? 'to' : 'from']))}#${x.pin}（⌀${x.wire.gauge}）`
+    ).join('<br>');
+    return `<tr>
+      <td>${esc(s.name)}</td><td>${esc(s.kindName)}</td>
+      <td>${s.ports}/${s.count}</td><td>⌀${s.gaugeMin}~⌀${s.gaugeMax}（实 ${esc(s.gaugeRange)}）</td>
+      <td>${s.strip}</td><td>${s.sleeveD ? '⌀' + s.sleeveD + '×' + s.sleeveLen : '—'}</td>
+      <td class="l">${wires}</td></tr>`;
+  }).join('');
+  return `<div class="page">
+  <svg width="${PAGE_W}mm" height="${PAGE_H}mm" viewBox="0 0 ${PAGE_W} ${PAGE_H}" xmlns="http://www.w3.org/2000/svg">
+    <foreignObject x="${MARGIN}" y="${MARGIN}" width="${PAGE_W - 2 * MARGIN}" height="${PAGE_H - 2 * MARGIN}">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:sans-serif;color:#000">
+        <h3 style="margin:0 0 6px;font-size:15px">${esc(design.name)} — 拼接件下料与压接工艺表</h3>
+        <table style="border-collapse:collapse;width:100%;font-size:11px" border="1">
+          <thead><tr style="background:#eee">
+            <th>拼接件</th><th>类型</th><th>容量/已接</th><th>适用/实配线径</th>
+            <th>剥线mm</th><th>保护套mm</th><th style="text-align:left">集线线号与孔位（剥线→集线→压接→套管确认）</th>
+          </tr></thead><tbody>${rows}</tbody></table>
+        <p style="font-size:10px;color:#444;margin-top:8px">
+          工艺：按孔位逐根送线到位 → 集线核对线径组合与容量 → 压接/超声焊接 → 套保护套并热缩确认；未接齐不得完成。</p>
+      </div>
+    </foreignObject>
+  </svg>
+</div>`;
 }
 
 // ---------- 线号标签 ----------
@@ -199,7 +261,7 @@ export function openLabels(design) {
         <text x="${x + 7}" y="${y + 5.2}" font-size="4.2" font-weight="bold">${esc(r.label)}</text>
         <text x="${x + 7}" y="${y + 9.6}" font-size="3">${esc(r.from)} → ${esc(r.to)}　⌀${r.gauge}</text>
         <text x="${x + LW - 2}" y="${y + 5.2}" font-size="3.6" text-anchor="end">${r.rounded}mm</text>
-        <text x="${x + LW - 2}" y="${y + 9.6}" font-size="2.8" text-anchor="end">剥${r.stripFrom}/${r.stripTo}</text>
+        <text x="${x + LW - 2}" y="${y + 9.6}" font-size="2.8" text-anchor="end">剥${r.stripFrom}/${r.stripTo}${r.sleeveFrom || r.sleeveTo ? ' 套' + esc([r.sleeveFrom, r.sleeveTo].filter(Boolean).join('/')) : ''}</text>
       </g>`;
     });
     pages += `<div class="page">
