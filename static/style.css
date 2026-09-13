@@ -136,3 +136,74 @@ table.list tr.cur td { background: #bbdefb; }
 .pulse { animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 .vhandle:hover { fill: #ffe9a8; }
+
+/* ---------- 电气检验批次页 ---------- */
+#topbar a.navlink { color: #80cbc4; text-decoration: none; }
+#topbar a.navlink:hover { text-decoration: underline; }
+#qcMain { flex: 1; display: flex; min-height: 0; }
+#qcLeft {
+  width: 320px; background: #fafbfc; border-right: 1px solid #b0bec5;
+  overflow: auto; padding: 10px;
+}
+#qcLeft h4 { margin: 12px 0 6px; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+#qcLeft h4:first-child { margin-top: 0; }
+#qcCenter { flex: 1; overflow: auto; padding: 10px; background: #eceff1; }
+#qcRight {
+  width: 430px; background: #fafbfc; border-left: 1px solid #b0bec5;
+  display: flex; flex-direction: column; min-height: 0;
+}
+#qcTabs { display: flex; border-bottom: 1px solid #b0bec5; }
+#qcTabs .tab {
+  flex: 1; border: none; border-radius: 0; background: #eceff1; padding: 7px 0;
+  border-bottom: 2px solid transparent;
+}
+#qcTabs .tab.active { background: #fff; border-bottom-color: #1565c0; font-weight: 700; }
+.qc-panel { flex: 1; overflow: auto; padding: 10px; }
+.qc-status { padding: 2px 12px; border-radius: 11px; font-weight: 700; font-size: 12px; color: #fff; }
+.qc-status:empty { display: none; }
+.qc-status.preparing { background: #546e7a; }
+.qc-status.testing { background: #f9a825; color: #212121; }
+.qc-status.review { background: #1565c0; }
+.qc-status.archived { background: #2e7d32; }
+.meta { font-size: 12px; color: #555; margin: 2px 0; }
+.netitem { border: 1px solid #cfd8dc; border-radius: 5px; padding: 5px 8px; margin: 5px 0; background: #fff; font-size: 12px; }
+.netitem.done { border-color: #a5d6a7; background: #f1f8e9; }
+.netitem .eps { font-size: 11px; color: #666; }
+.netitem .prog { font-size: 11px; color: #37474f; display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
+.netitem button, .mini { font-size: 11px; padding: 1px 6px; }
+.recitem { padding: 5px 8px; border-radius: 5px; margin: 4px 0; background: #fff; border: 1px solid #cfd8dc; cursor: pointer; font-size: 12px; }
+.recitem:hover { background: #eef4fb; }
+.recitem.cur { border-color: #2e7d32; background: #f1f8e9; }
+.conn-card {
+  display: inline-block; background: #fff; border: 1px solid #b0bec5; border-radius: 6px;
+  margin: 0 10px 10px 0; padding: 4px; vertical-align: top;
+}
+.qc-pin { cursor: pointer; }
+.qc-pin:hover circle { stroke-width: 2.5; }
+#entryFields { border: 1px solid #b0bec5; border-radius: 6px; background: #fff; padding: 8px 10px; margin: 0; }
+#entryFields:disabled { opacity: .55; }
+#entryFields legend { padding: 0 6px; font-weight: 700; color: #37474f; }
+#entryFields .row { margin: 5px 0; }
+#entryFields input[type=number] { width: 90px; }
+#scanInput { width: 220px; }
+#pausedBanner { background: #fff8e1; border: 1px solid #f9a825; border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; }
+#emptyHint { background: #fff; border: 1px dashed #90a4ae; border-radius: 6px; padding: 30px; text-align: center; color: #607d8b; }
+.anomitem { border: 1px solid #cfd8dc; border-left-width: 3px; border-radius: 4px; background: #fff; padding: 6px 8px; margin: 6px 0; font-size: 12px; }
+.anomitem.error { border-left-color: #c62828; }
+.anomitem.manual { border-left-color: #6a1b9a; }
+.anomitem.warn { border-left-color: #f9a825; }
+.anomitem.resolved { opacity: .75; background: #f6f9f6; }
+.anomitem .amsg { color: #444; margin: 2px 0; }
+.dp-form { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+.dp-form select { max-width: 150px; }
+.dp-form input { flex: 1; min-width: 100px; }
+.dp-hist { color: #2e7d32; font-size: 11px; margin-top: 2px; }
+tr.wd td { color: #999; text-decoration: line-through; }
+tr.badrow td { background: #ffebee; }
+tr.warnrow td { background: #fff8e1; }
+.modal-mask { position: fixed; inset: 0; background: #0006; z-index: 50; display: flex; align-items: center; justify-content: center; }
+.modal { background: #fff; border-radius: 8px; padding: 16px; width: 400px; box-shadow: 0 8px 30px #0005; }
+.modal h4 { margin-top: 0; }
+#nbName { width: 240px; }
+#csvText { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+#qcTab-archive .chk { display: block; margin: 3px 0; }

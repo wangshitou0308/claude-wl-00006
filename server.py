@@ -295,7 +295,7 @@ def db_readings_import(bid, rows):
                 continue
             con.execute(
                 'INSERT INTO readings(batch_id, a, b, result, ohms, unit, polarity, source, operator, note,'
-                " withdrawn, created_at) VALUES(?,?,?,?,?,?,?,?,'csv',?,?,0,?)",
+                " withdrawn, created_at) VALUES(?,?,?,?,?,?,?,'csv',?,?,0,?)",
                 (bid, rec['a'], rec['b'], rec['result'], rec['ohms'], rec['unit'], rec['polarity'],
                  rec['operator'], rec['note'], now_iso()))
             inserted += 1
@@ -386,6 +386,22 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 路由 ----------
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            self._error(500, '服务内部错误：%s' % e)
+
+    def do_POST(self):
+        try:
+            self._do_POST()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            self._error(500, '服务内部错误：%s' % e)
+
+    def _do_GET(self):
         path = urlparse(self.path).path
         if path == '/api/health':
             return self._json({'ok': True, 'time': now_iso()})
@@ -443,7 +459,7 @@ class Handler(BaseHTTPRequestHandler):
             d['analysis'] = qc.analyze(d['snapshot'], d['readings'], d['dispositions'])
         return self._json(details)
 
-    def do_POST(self):
+    def _do_POST(self):
         path = urlparse(self.path).path
         try:
             body = self._body()
