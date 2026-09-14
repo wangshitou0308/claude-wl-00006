@@ -88,11 +88,31 @@ class _UF:
 
 # ---------- 快照 ----------
 
+def _normalize_nets(raw):
+    """归一化接线表：新格式 {name,endpoints:[...]}，旧格式 {label,from,to}。"""
+    out = []
+    for n in raw or []:
+        if not isinstance(n, dict):
+            continue
+        if isinstance(n.get('endpoints'), list):
+            name = n.get('name') or n.get('label') or 'NET'
+            eps = [str(e) for e in n['endpoints'] if e]
+        else:
+            name = n.get('name') or n.get('label') or 'NET'
+            eps = [str(n.get('from') or ''), str(n.get('to') or '')]
+            eps = [e for e in eps if e]
+        if eps:
+            out.append({'name': str(name), 'endpoints': eps})
+    return out
+
+
 def build_snapshot(design, design_id=None, design_name=None):
     """从钉板方案构建检验快照：连接器、端子（针位）与接线网络。
 
-    导线两端可落在连接器端子或拼接件孔位；同一拼接件的所有孔位内部导通，
-    因此沿“导线 + 拼接件”用并查集追踪多分支网络，保留拼接拓扑（splices）。"""
+    导线两端可落在连接器端子或拼接件孔位；拼接件所有孔位内部导通，导线再把
+    连接器端子与孔位、孔位与孔位串起来，因此可沿“导线 + 拼接件”用并查集追踪
+    多级串接（J1—S1—S2—J2/J3）。网络名优先取接线表（保留原名如 BRANCH），
+    快照同时保留每个拼接件的孔位 → 端子/线号映射（wiring）。"""
     nodes = design.get('nodes') or []
     wires = design.get('wires') or []
     conns = [n for n in nodes if n.get('type') == 'connector']
@@ -109,89 +129,127 @@ def build_snapshot(design, design_id=None, design_name=None):
     } for c in conns]
     by_id = {n.get('id'): n for n in nodes}
 
-    # 拼接件拓扑：每个孔位 → 连接器端子（经一根导线）
+    # 拼接件：保留容量、线径、剥线、保护套；wiring 记录孔位对应关系
     splices = []
-    splice_port_term = {}   # (splice_id, pin) -> 连接器端子
-    splice_wire = {}        # wire_id -> splice_id
+    splice_by_id = {}
     for sp in nodes:
         if sp.get('type') != 'splice':
             continue
         ports = max(2, int(sp.get('ports') or 4))
-        splices.append({
+        item = {
             'id': sp.get('id'), 'name': str(sp.get('name')),
             'kind': str(sp.get('kind') or 'cap'), 'ports': ports,
             'gauge_min': sp.get('gaugeMin', 0.5), 'gauge_max': sp.get('gaugeMax', 5),
             'strip': sp.get('strip', 7),
             'sleeve_d': sp.get('sleeveD', 0), 'sleeve_len': sp.get('sleeveLen', 0),
-        })
+            'wiring': [],
+        }
+        splices.append(item)
+        splice_by_id[sp.get('id')] = item
+
+    def port_key(sid, pin):
+        return 'port:%s#%s' % (sid, pin)
 
     uf = _UF()
-    links = []  # (端点A, 端点B, 线号)
-    wire_terms = {}  # wire_id -> [from_term or None, to_term or None]
+    # 拼接件本体：其全部孔位内部导通
+    for item in splices:
+        body = port_key(item['id'], 0)
+        uf.find(body)
+        for p in range(1, item['ports'] + 1):
+            uf.union(body, port_key(item['id'], p))
+
+    links = []                       # (端子A, 端子B, 线号)
+    wire_terms = {}                  # wire_id -> [from_term|None, to_term|None]
+    connector_terms = set()
     for w in wires:
-        eps = []
+        keys, terms = [], []
         for side in ('from', 'to'):
             ep = w.get(side) or {}
             node = by_id.get(ep.get('node'))
             pin = ep.get('pin')
             if node and node.get('type') == 'connector' and isinstance(pin, int) and pin >= 1:
-                eps.append('%s.%d' % (node.get('name'), pin))
+                t = '%s.%d' % (node.get('name'), pin)
+                keys.append(t); terms.append(t); connector_terms.add(t)
+            elif node and node.get('type') == 'splice' and isinstance(pin, int) and pin >= 1:
+                keys.append(port_key(node.get('id'), pin)); terms.append(None)
             else:
-                eps.append(None)
-        wire_terms[w.get('id')] = eps
-        a, b = eps
-        if a and b and a != b:
-            uf.union(a, b)
-            links.append((a, b, str(w.get('label') or '')))
+                keys.append(None); terms.append(None)
+        wire_terms[w.get('id')] = terms
+        ka, kb = keys
+        if ka and kb:
+            uf.union(ka, kb)
+        ta, tb = terms
+        if ta and tb and ta != tb:
+            links.append((ta, tb, str(w.get('label') or '')))
 
-    # 拼接件：把同件各孔所连导线的对侧连接器端子全部并起来
-    for sp in splices:
-        sid = sp['id']
-        terms = set()
-        for w in wires:
-            for i, side in enumerate(('from', 'to')):
-                ep = w.get(side) or {}
-                if ep.get('node') != sid:
-                    continue
-                pin = ep.get('pin')
-                opp = wire_terms.get(w.get('id'))
-                if opp:
-                    t = opp[1 - i]  # 对侧连接器端子
-                    if t:
-                        terms.add(t)
-                        splice_port_term[(sid, pin)] = t
-                        splice_wire[w.get('id')] = sid
-        terms = list(terms)
-        for t in terms[1:]:
-            uf.union(terms[0], t)
-
-    if not links and not splice_port_term:
+    if not wires:
+        raise ValueError('方案中没有已连接的导线')
+    if not connector_terms:
         raise ValueError('方案中没有已连接的导线')
 
+    # 孔位 → 对侧连接器端子/线号（多级拼接时对侧可能仍是孔位，记录相邻键与线号）
+    for w in wires:
+        wid = w.get('id')
+        for i, side in enumerate(('from', 'to')):
+            ep = w.get(side) or {}
+            node = by_id.get(ep.get('node'))
+            if not node or node.get('type') != 'splice':
+                continue
+            item = splice_by_id.get(node.get('id'))
+            if not item:
+                continue
+            opp_term = wire_terms.get(wid, [None, None])[1 - i]
+            item['wiring'].append({
+                'port': ep.get('pin'),
+                'wire': str(w.get('label') or ''),
+                'terminal': opp_term or '',   # 对侧不是连接器时为空（仍经拼接链接出）
+                'side': side,
+            })
+
+    # 物理分量（仅连接器端子）
     groups = {}
+    for t in connector_terms:
+        groups.setdefault(uf.find(t), set()).add(t)
+
+    # 网络名：优先接线表（同一名字可覆盖多个端子）；分量内名字不一致时拼接展示
+    net_table = _normalize_nets(design.get('nets'))
+    name_of = {}
+    for nrow in net_table:
+        for ep in nrow['endpoints']:
+            if parse_endpoint(ep):
+                name_of[norm_endpoint(ep)] = nrow['name']
     labels = {}
-    all_terms = set()
-    for a, b, lb in links:
-        all_terms.update((a, b))
-    all_terms.update(splice_port_term.values())
-    for t in all_terms:
-        root = uf.find(t)
-        groups.setdefault(root, set()).add(t)
     for a, b, lb in links:
         root = uf.find(a)
         if lb:
             lst = labels.setdefault(root, [])
             if lb not in lst:
                 lst.append(lb)
+
     nets = []
     for i, root in enumerate(sorted(groups, key=lambda r: sort_endpoints(groups[r])[0])):
-        members = sort_endpoints(groups[root])
-        via = sorted({sid for (sid, _pin), t in splice_port_term.items() if t in groups[root]})
+        members_set = groups[root]
+        members = sort_endpoints(members_set)
+        given = []
+        for t in members:
+            nm = name_of.get(t)
+            if nm and nm not in given:
+                given.append(nm)
+        if len(given) == 1:
+            label = given[0]
+        elif len(given) > 1:
+            label = '/'.join(given)           # 跨网合并：名字都保留，便于复核
+        else:
+            label = '/'.join(labels.get(root, [])) or ('网络%d' % (i + 1))
+        via = sorted({splice_by_id[_sid]['name']
+                      for _sid in splice_by_id
+                      if any(uf.find(port_key(_sid, wrec['port'])) == root
+                             for wrec in splice_by_id[_sid]['wiring'])})
         nets.append({
             'id': 'NET%d' % (i + 1),
-            'label': '/'.join(labels.get(root, [])) or ('网络%d' % (i + 1)),
+            'label': label,
             'endpoints': members,
-            'splices': [next((s['name'] for s in splices if s['id'] == sid), sid) for sid in via],
+            'splices': via,
         })
     terminals = []
     for c in connectors:

@@ -591,16 +591,18 @@ function printSheet() {
     const via = n.splices && n.splices.length ? `（经拼接 ${n.splices.join('、')}）` : '';
     return `<tr><td>${esc(n.id)}</td><td>${esc(n.label)}</td><td>${n.endpoints.map(esc).join(' · ')}${via}</td><td>${c && c.covered ? '已覆盖' : '未覆盖'}</td></tr>`;
   }).join('');
-  // 拼接拓扑快照
+  // 拼接拓扑快照：逐孔位保留 孔 → 线号 → 对侧端子
   const spl = snap.splices || [];
   const splRows = spl.map(s => {
-    const used = new Set();
-    snap.nets.forEach(n => (n.splices || []).includes(s.name) && n.endpoints.forEach(e => used.add(e)));
     const kindName = { cap: '闭端', butt: '对接', ultra: '超声焊' }[s.kind] || s.kind;
+    const wiring = (s.wiring || []).slice().sort((a, b) => a.port - b.port);
+    const ports = wiring.map(w =>
+      `<tr><td>${esc(s.name)}#${w.port}</td><td>${esc(w.wire || '—')}</td><td>${w.terminal ? esc(w.terminal) : '→拼接链'}</td></tr>`
+    ).join('');
     return `<tr><td>${esc(s.name)}</td><td>${esc(kindName)}</td><td>${s.ports} 孔</td>
       <td>⌀${s.gauge_min}~⌀${s.gauge_max}</td><td>${s.strip}</td>
       <td>${s.sleeve_d ? '⌀' + s.sleeve_d + '×' + s.sleeve_len : '—'}</td>
-      <td>${[...used].map(esc).join(' · ')}</td></tr>`;
+      <td><table class="inner">${ports || '<tr><td colspan="3">（未接线）</td></tr>'}</table></td></tr>`;
   }).join('');
   const readRows = cur.readings.map(r => `<tr${r.withdrawn ? ' class="wd"' : ''}>
     <td>${r.id}</td><td>${esc(r.created_at).replace('T', ' ')}</td><td>${esc(r.a)}</td><td>${esc(r.b)}</td>
@@ -622,8 +624,8 @@ function printSheet() {
     读数 ${an.stats.readings}（撤回 ${an.stats.withdrawn}）　网络覆盖 ${an.stats.covered}/${an.stats.nets}　未决异常 ${an.stats.unresolved}</p>
     <h3>一、网络与针位</h3>
     <table><thead><tr><th>网络</th><th>线号</th><th>针位（拼接拓扑）</th><th>覆盖</th></tr></thead><tbody>${netRows}</tbody></table>
-    ${splRows ? `<h3>二、实体拼接件</h3>
-    <table><thead><tr><th>拼接件</th><th>类型</th><th>容量</th><th>适用线径</th><th>剥线mm</th><th>保护套mm</th><th>连通端子</th></tr></thead>
+    ${splRows ? `<h3>二、实体拼接件（孔位 → 线号 → 对侧端子）</h3>
+    <table><thead><tr><th>拼接件</th><th>类型</th><th>容量</th><th>适用线径</th><th>剥线mm</th><th>保护套mm</th><th>孔位映射</th></tr></thead>
     <tbody>${splRows}</tbody></table>` : ''}
     <h3>${splRows ? '三' : '二'}、实测读数</h3>
     <table><thead><tr><th>#</th><th>时间</th><th>测点 A</th><th>测点 B</th><th>结果</th><th>阻值</th><th>极性</th><th>检验人</th><th>来源</th><th>备注</th></tr></thead>
@@ -646,6 +648,7 @@ function printWindow(title, bodyHtml) {
   th, td { border: 1px solid #666; padding: 3px 6px; text-align: left; }
   th { background: #eee; }
   tr.wd td { color: #999; text-decoration: line-through; }
+  table.inner { width: auto; } table.inner td { border: none; padding: 0 8px 0 0; }
   .sign { margin-top: 24px; }
   @media print { .noprint { display: none; } }
 </style></head><body>

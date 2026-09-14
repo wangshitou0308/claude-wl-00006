@@ -205,6 +205,59 @@ butt['nodes'][3]['ports'] = 3
 bsnap = qc.build_snapshot(butt)
 ok(bsnap['splices'][0]['kind'] == 'butt', '对接拼接类型保留')
 
+print('== 多级拼接链：网络名与孔位映射 ==')
+
+
+def chain_design():
+    return {
+        'version': 2, 'name': 'BRANCH',
+        'board': {'width': 900, 'height': 600, 'grid': 10}, 'settings': {},
+        'nodes': [
+            {'id': 'j1', 'type': 'connector', 'x': 0, 'y': 0, 'name': 'J1', 'pins': 2},
+            {'id': 'j2', 'type': 'connector', 'x': 300, 'y': 0, 'name': 'J2', 'pins': 2},
+            {'id': 'j3', 'type': 'connector', 'x': 300, 'y': 200, 'name': 'J3', 'pins': 2},
+            {'id': 's1', 'type': 'splice', 'x': 100, 'y': 100, 'name': 'S1',
+             'kind': 'butt', 'ports': 3, 'gaugeMin': 0.5, 'gaugeMax': 3,
+             'strip': 7, 'sleeveD': 4, 'sleeveLen': 20},
+            {'id': 's2', 'type': 'splice', 'x': 200, 'y': 100, 'name': 'S2',
+             'kind': 'cap', 'ports': 3, 'gaugeMin': 0.5, 'gaugeMax': 3,
+             'strip': 7, 'sleeveD': 0, 'sleeveLen': 0},
+        ],
+        'zones': [],
+        'wires': [
+            {'id': 'w1', 'label': 'W1', 'from': {'node': 'j1', 'pin': 1}, 'to': {'node': 's1', 'pin': 1}},
+            {'id': 'w2', 'label': 'W2', 'from': {'node': 's1', 'pin': 2}, 'to': {'node': 's2', 'pin': 1}},
+            {'id': 'w3', 'label': 'W3', 'from': {'node': 's2', 'pin': 2}, 'to': {'node': 'j2', 'pin': 1}},
+            {'id': 'w4', 'label': 'W4', 'from': {'node': 'j3', 'pin': 1}, 'to': {'node': 's2', 'pin': 3}},
+        ],
+        'nets': [{'name': 'BRANCH', 'endpoints': ['J1.1', 'J2.1', 'J3.1']}],
+    }
+
+
+csnap = qc.build_snapshot(chain_design())
+ok(len(csnap['nets']) == 1, '两级拼接链只生成 1 个网络（实际 %d）' % len(csnap['nets']))
+cnet = csnap['nets'][0]
+ok(cnet['endpoints'] == ['J1.1', 'J2.1', 'J3.1'], '链式三端网络端子正确：%s' % cnet['endpoints'])
+ok(cnet['label'] == 'BRANCH', '保留原网络名 BRANCH（实际 %s）' % cnet['label'])
+ok(cnet['splices'] == ['S1', 'S2'], '网络标注经由 S1、S2：%s' % cnet['splices'])
+# 孔位映射 S1#1→J1.1/W1, S1#2→拼接链/W2；S2 三孔
+s1 = next(s for s in csnap['splices'] if s['name'] == 'S1')
+s2 = next(s for s in csnap['splices'] if s['name'] == 'S2')
+m1 = {(w['port'], w['wire']): w['terminal'] for w in s1['wiring']}
+ok(m1.get((1, 'W1')) == 'J1.1' and m1.get((2, 'W2')) == '', 'S1 孔位映射 S1#1→J1.1、S1#2→拼接链')
+ports2 = sorted((w['port'], w['wire'], w['terminal']) for w in s2['wiring'])
+ok(ports2 == [(1, 'W2', ''), (2, 'W3', 'J2.1'), (3, 'W4', 'J3.1')],
+   'S2 孔位映射 S2#1/#2/#3 完整：%s' % (ports2,))
+# 链式网络 2 对导通即可全覆盖
+an = qc.analyze(csnap, [R('J1.1', 'J2.1', 'continuity', ohms=0.1, unit='Ω'),
+                        R('J1.1', 'J3.1', 'continuity', ohms=0.1, unit='Ω')])
+ok(an['stats']['covered'] == 1 and not an['anomalies'], '链式三端网络 2 对导通全覆盖无异常')
+# 旧版接线表 {label,from,to} 同样可用于取名
+oldfmt = chain_design()
+oldfmt['nets'] = [{'label': 'W1', 'from': 'J1.1', 'to': 'J2.1'}]
+osnap = qc.build_snapshot(oldfmt)
+ok(osnap['nets'][0]['label'] in ('W1', '网络1'), '旧版接线表不报错（实际名 %s）' % osnap['nets'][0]['label'])
+
 print('== 接口（状态机与导入） ==')
 srv = server.create_server('127.0.0.1', 0)
 port = srv.server_address[1]

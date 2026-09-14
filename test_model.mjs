@@ -313,6 +313,68 @@ console.log('== 拼接件装配步骤与清单 ==');
   ok(sl.length === 1 && sl[0].count === 3 && sl[0].kindName.includes('闭端'), '拼接件清单 3 线接入');
 }
 
+console.log('== 回归：装配字段与多级拼接链 ==');
+{
+  // Bug1：导线步骤必须带数值 length/shared（渲染层直接 toFixed），含拼接件方案也不能停在“尚未布线”
+  const dd = M.sampleDesign();
+  const steps = M.assemblySteps(dd, new Set());
+  ok(steps.filter(s => s.kind === 'wire').every(s => typeof s.length === 'number' && typeof s.shared === 'number'),
+    '所有送线步骤含数值 length/shared，toFixed 不异常');
+  ok(steps.filter(s => s.kind === 'wire').every(s => typeof s.locked === 'boolean'), '送线步骤含 locked 字段');
+
+  // 导入的合法 v1 方案（旧接线表、无拼接件）同样可生成装配步骤
+  const v1 = {
+    version: 1, name: 'v1', board: { width: 900, height: 600, grid: 10 }, settings: {},
+    nodes: [
+      M.makeNode('connector', 0, 0, 'J1', 2),
+      M.makeNode('connector', 100, 0, 'J2', 2),
+    ],
+    zones: [], wires: [],
+    nets: [{ label: 'W-1', from: 'J1.1', to: 'J2.1' }],
+  };
+  const w = M.makeWire(v1, v1.nodes[0].id, 1);
+  w.to = { node: v1.nodes[1].id, pin: 1 };
+  w.path = [{ x: 0, y: 0, node: v1.nodes[0].id }, { x: 100, y: 0, node: v1.nodes[1].id }];
+  v1.wires.push(w);
+  M.migrateDesign(v1);
+  const vsteps = M.assemblySteps(v1, new Set());
+  ok(vsteps.length === 1 && vsteps[0].kind === 'wire' && Number.isFinite(vsteps[0].length),
+    '导入 v1 方案后装配步骤正常（length 为数值）');
+
+  // Bug2：两级拼接链 J1.1—S1—S2—J2.1/J3.1 必须识别为同一个三端网络
+  const dc = M.createDesign('BRANCH');
+  const J1 = M.makeNode('connector', 0, 0, 'J1', 2);
+  const J2 = M.makeNode('connector', 300, 0, 'J2', 2);
+  const J3 = M.makeNode('connector', 300, 200, 'J3', 2);
+  const S1 = M.makeSplice(100, 100, 'S1', 'butt', 3);
+  const S2 = M.makeSplice(200, 100, 'S2', 'cap', 3);
+  dc.nodes.push(J1, J2, J3, S1, S2);
+  const add = (label, fr, fp, to, tp) => {
+    const x = M.makeWire(dc, fr, fp); x.label = label;
+    x.to = { node: to, pin: tp };
+    x.path = [{ x: 0, y: 0, node: fr }, { x: 0, y: 0, node: to }];
+    dc.wires.push(x);
+  };
+  add('W1', J1.id, 1, S1.id, 1);
+  add('W2', S1.id, 2, S2.id, 1);
+  add('W3', S2.id, 2, J2.id, 1);
+  add('W4', J3.id, 1, S2.id, 3);
+  dc.nets = [{ name: 'BRANCH', endpoints: ['J1.1', 'J2.1', 'J3.1'] }];
+  const comps = [...M.physicalTopology(dc).groups.values()].map(s => [...s].sort());
+  ok(comps.length === 1 && comps[0].join(',') === 'J1.1,J2.1,J3.1',
+    '两级拼接链识别为同一三端网络（实际 ' + JSON.stringify(comps) + '）');
+  ok(!M.validate(dc).some(i => i.kind === 'net-open' || (i.kind === 'net-merge')),
+    '两级拼接链不误报未连通/跨网合并');
+  M.autoNets(dc);
+  ok(dc.nets.length === 1 && dc.nets[0].name === 'BRANCH', '从布线生成沿用网络名 BRANCH');
+
+  // 反向：真正未连通仍须报 net-open
+  const dn = M.createDesign('n');
+  dn.nodes.push(J1, J2);
+  dn.nets = [{ name: 'X', endpoints: ['J1.2', 'J2.2'] }];
+  ok(M.validate(dn).some(i => i.kind === 'net-open'), '真实未连通网络仍报未连通');
+}
+
 console.log('== 旧方案迁移 ==');
 {
   const old = {

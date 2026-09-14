@@ -208,49 +208,51 @@ export function normalizeNets(nets) {
   });
 }
 
-// 沿导线与拼接件并查集，求物理连通分量（端子字符串集合）。
-// 拼接件的所有孔位内部导通；悬空的拼接孔位不计入端子。
+// 拼接件孔位在并查集中的节点键（不对外展示，仅用于追踪）
+function portKey(spId, pin) { return `port:${spId}#${pin}`; }
+
+// 沿导线与拼接件并查集，求物理连通分量（连接器端子字符串集合）。
+// 拼接件所有孔位内部导通；导线把其两端键（连接器端子或拼接孔）合并，
+// 因而可正确追踪 J1—S1—S2—J2/J3 这样的多级串接拼接链。
 export function physicalTopology(design) {
   const uf = new UF();
-  const links = []; // {a,b,wire,side?} 有效连通段
-  const wireEnds = new Map(); // wireId → [端子或null, 端子或null]
-  const termNode = new Map(); // 端串 → 连接器节点
+  const links = []; // {a,b,wire} 两端均为连接器端子的有效连通段
+  const wireEnds = new Map(); // wireId → [连接器端子或null, 连接器端子或null]
+  const termNode = new Map(); // 连接器端串 → 节点
+
+  // 导线每一端的并查集键与（若是连接器）端子串
+  const endKey = new Map(); // wireId → [keyFrom, keyTo]
   for (const w of design.wires) {
-    const eps = [];
+    const keys = [], terms = [];
     for (const side of ['from', 'to']) {
       const ep = w[side];
       const n = ep && ep.node ? nodeById(design, ep.node) : null;
       if (n && n.type === 'connector' && ep.pin >= 1) {
         const t = `${n.name}.${ep.pin}`;
-        eps.push(t);
-        termNode.set(t, n);
+        keys.push(t); terms.push(t); termNode.set(t, n);
+      } else if (n && n.type === 'splice' && ep.pin >= 1) {
+        keys.push(portKey(n.id, ep.pin)); terms.push(null);
       } else {
-        eps.push(null);
+        keys.push(null); terms.push(null);
       }
     }
-    wireEnds.set(w.id, eps);
-    const [a, b] = eps;
-    if (a && b && a !== b) {
-      uf.union(a, b);
-      links.push({ a, b, wire: w.id });
-    }
+    wireEnds.set(w.id, terms);
+    endKey.set(w.id, keys);
+    const [a, b] = terms;
+    if (a && b && a !== b) links.push({ a, b, wire: w.id });
   }
-  // 拼接件把同件各孔所连导线的连接器端子全部并起来
+  // 拼接件本体：其所有孔位内部导通
   for (const sp of design.nodes.filter(n => n.type === 'splice')) {
-    const terms = new Set();
-    for (const w of design.wires) {
-      for (const side of ['from', 'to']) {
-        const ep = w[side];
-        if (!ep || ep.node !== sp.id) continue;
-        // 取拼接孔对侧的连接器端子（本侧是拼接件，其端子串为 null）
-        const t = wireEnds.get(w.id)[side === 'from' ? 1 : 0];
-        if (t) terms.add(t);
-      }
-    }
-    const arr = [...terms];
-    for (let i = 1; i < arr.length; i++) uf.union(arr[0], arr[i]);
+    const body = portKey(sp.id, 0);
+    uf.add(body);
+    for (let p = 1; p <= Math.max(2, sp.ports || 2); p++) uf.union(body, portKey(sp.id, p));
   }
-  // 汇总分量
+  // 导线合并其两端
+  for (const w of design.wires) {
+    const [ka, kb] = endKey.get(w.id);
+    if (ka && kb) uf.union(ka, kb);
+  }
+  // 分量：仅汇总连接器端子
   const groups = new Map();
   for (const t of termNode.keys()) {
     const r = uf.find(t);
@@ -944,7 +946,8 @@ export function assemblyOrder(design) {
 export function assemblySteps(design, confirmedWires) {
   const order = assemblyOrder(design);
   const wireIdx = new Map(order.map((o, i) => [o.wireId, i]));
-  const steps = order.map(o => ({ kind: 'wire', wireId: o.wireId, label: o.label, order: o }));
+  // 导线步骤直接展开装配顺序字段（length/shared/locked），渲染层直接 toFixed
+  const steps = order.map((o, i) => ({ ...o, kind: 'wire', sort: i }));
   for (const sp of design.nodes.filter(n => n.type === 'splice')) {
     const att = [];
     for (const w of design.wires) {
@@ -959,12 +962,11 @@ export function assemblySteps(design, confirmedWires) {
       label: `${spliceKind(sp.kind).name} ${sp.name}`,
       splice: sp, attaches: att, count: att.length,
       doneWires: done, ready: att.length >= 2 && done === att.length,
+      // 排在最后一根所属导线之后、下一根导线之前
       sort: maxIdx + 0.5,
     });
   }
-  // 导线按原序号，拼接件排在最后一根所属导线之后
-  return steps.map((s, i) => ({ ...s, sort: s.kind === 'wire' ? i : s.sort }))
-    .sort((a, b) => a.sort - b.sort);
+  return steps.sort((a, b) => a.sort - b.sort);
 }
 
 // ---------- 路径整理（跳过锁定） ----------
