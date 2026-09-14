@@ -3,6 +3,7 @@
 
 import {
   resolvePath, computeBundles, tieList, nodeById, polyLen, dist, spliceKind,
+  coverGeometry, coverKind, coverById, wireById, pointAtArcOnPath,
 } from './model.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
@@ -78,6 +79,7 @@ export function render(ctx) {
   renderZones(ctx);
   renderBundles(ctx);
   renderWires(ctx);
+  renderCovers(ctx);
   renderTies(ctx);
   renderNodes(ctx);
   renderOverlay(ctx);
@@ -174,6 +176,99 @@ function renderWires(ctx) {
     h += `</g>`;
   }
   layers.wire.innerHTML = h;
+}
+
+// ---------- 包覆层（波纹管 / 编织套管 / 胶带缠绕） ----------
+
+// 沿折线生成等距法向刻度（波纹环纹 / 缠带斜纹 / 编织纹）
+function hatchMarks(pts, spacing, halfW, skew = 0) {
+  let out = '';
+  let acc = spacing / 2;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const L = dist(a, b);
+    const ux = (b.x - a.x) / L, uy = (b.y - a.y) / L;
+    const nx = -uy, ny = ux;
+    for (; acc <= L; acc += spacing) {
+      const cx = a.x + ux * acc, cy = a.y + uy * acc;
+      const dx = nx * halfW + ux * skew, dy = ny * halfW + uy * skew;
+      out += `<line x1="${cx - dx}" y1="${cy - dy}" x2="${cx + dx}" y2="${cy + dy}" stroke="#ffffff" stroke-width="0.5" opacity="0.7"/>`;
+    }
+    acc -= L;
+  }
+  return out;
+}
+
+function coverPathD(geo) {
+  if (!geo.pts.length) return '';
+  return geo.pts.map((p, i) => (i ? 'L' : 'M') + p.x.toFixed(1) + ' ' + p.y.toFixed(1)).join(' ');
+}
+
+function renderCovers(ctx) {
+  const { design, layers } = ctx;
+  if (!ctx.opts.showCovers) { layers.cover.innerHTML = ''; return; }
+  let h = '';
+  for (const c of design.covers || []) {
+    const geo = coverGeometry(design, c);
+    if (!geo.pts.length) continue;
+    const sel = ctx.sel.kind === 'cover' && ctx.sel.id === c.id;
+    const kd = coverKind(c.kind);
+    const bad = geo.broken.length || geo.dangling.length;
+    const d = coverPathD(geo);
+    const w = c.kind === 'tape' ? Math.max(2.2, geo.maxD + 1.2) : Math.max(c.innerD || 2, geo.maxD + 1);
+    const st = coverStepStateOf(ctx, c.id);
+    const op = st === 'dim' ? 0.18 : st === 'done' ? 0.55 : 0.92;
+    const stroke = bad ? '#c62828' : kd.color;
+    if (sel) h += `<path d="${d}" fill="none" stroke="#2f7df6" stroke-width="${(w + 3).toFixed(1)}" stroke-opacity="0.3" stroke-linejoin="round" stroke-linecap="round"/>`;
+    if (c.kind === 'tape') {
+      // 胶带：深色基带 + 白色斜纹（节距取有效节距的视觉近似）
+      const cut = geo && c;
+      const ov = Math.max(0, Math.min(90, c.overlap || 0)) / 100;
+      const eff = c.pitch > 0 ? c.pitch : (c.tapeW || 19) * (1 - ov);
+      h += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="${w}" stroke-opacity="${op}" stroke-linejoin="round" stroke-linecap="round"/>`;
+      h += `<g opacity="${Math.min(1, op + 0.08)}">${hatchMarks(geo.pts, Math.max(2, eff), w / 2, eff * 0.5)}</g>`;
+    } else if (c.kind === 'corr') {
+      h += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="${w}" stroke-opacity="${op * 0.55}" stroke-linejoin="round" stroke-linecap="round"/>`;
+      h += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="0.9" stroke-opacity="${op}" stroke-dasharray="2.2,1.6" stroke-linejoin="round" stroke-linecap="round"/>`;
+      h += `<g opacity="${Math.min(1, op + 0.05)}">${hatchMarks(geo.pts, 4, w / 2 + 0.3)}</g>`;
+    } else {
+      // 编织管：半透明褐色套 + 交叉网纹
+      h += `<path d="${d}" fill="none" stroke="${stroke}" stroke-width="${w}" stroke-opacity="${op * 0.4}" stroke-linejoin="round" stroke-linecap="round"/>`;
+      h += `<g opacity="${Math.min(1, op + 0.05)}">
+        ${hatchMarks(geo.pts, 3.2, w / 2 + 0.2, 1.4)}
+        ${hatchMarks(geo.pts, 3.2, w / 2 + 0.2, -1.4)}</g>`;
+    }
+    // 起止端帽
+    for (const p of [geo.pts[0], geo.pts[geo.pts.length - 1]]) {
+      h += `<circle cx="${p.x}" cy="${p.y}" r="${Math.min(3, w / 2 + 0.6)}" fill="${stroke}" opacity="${op}"/>`;
+    }
+    // 标签
+    if (ctx.opts.showLabels) {
+      const m = geo.pts[Math.floor(geo.pts.length / 2)];
+      h += `<text x="${m.x}" y="${m.y - w / 2 - 2}" font-size="4.2" fill="${bad ? '#c62828' : '#333'}" text-anchor="middle" class="halo">${esc(kd.glyph)}${esc(c.name)}${bad ? ' ⚠' : ''}</text>`;
+    }
+  }
+  // 包覆绘制预览
+  if (ctx.coverDraw && ctx.coverDraw.pts.length) {
+    const pts = [...ctx.coverDraw.pts];
+    if (ctx.coverDraw.cursor) pts.push(ctx.coverDraw.cursor);
+    const kd = coverKind(ctx.coverDraw.kind);
+    const dd = pts.map((p, i) => (i ? 'L' : 'M') + p.x.toFixed(1) + ' ' + p.y.toFixed(1)).join(' ');
+    h += `<path d="${dd}" fill="none" stroke="${kd.color}" stroke-width="5" stroke-opacity="0.4" stroke-dasharray="4,2" stroke-linecap="round" style="pointer-events:none"/>`;
+    for (const p of ctx.coverDraw.pts) h += `<circle cx="${p.x}" cy="${p.y}" r="2.4" fill="${kd.color}" style="pointer-events:none"/>`;
+  }
+  layers.cover.innerHTML = h;
+}
+
+function coverStepStateOf(ctx, coverId) {
+  const st = ctx.step;
+  if (!st || !st.active) return 'normal';
+  const step = st.steps ? st.steps[st.idx] : null;
+  if (step && step.kind === 'cover' && step.coverId === coverId) return 'current';
+  // 该包覆任一阶段未确认即不淡化
+  const related = st.steps.filter(s => s.kind === 'cover' && s.coverId === coverId);
+  if (related.some(s => !st.coverDone.has(`${coverId}:${s.phase}`))) return 'dim';
+  return 'done';
 }
 
 function renderTies(ctx) {
@@ -314,6 +409,27 @@ function renderOverlay(ctx) {
   if (ctx.preview) {
     const r = ctx.preview;
     h += `<rect x="${r.x}" y="${r.y}" width="${r.w}" height="${r.h}" fill="#f8d7da88" stroke="#c62828" stroke-width="${1 / z}" stroke-dasharray="${4 / z},${2 / z}" style="pointer-events:none"/>`;
+  }
+  // 选中包覆：显示路径锚点手柄（可拖动沿线改位）
+  if (ctx.sel.kind === 'cover') {
+    const c = coverById(design, ctx.sel.id);
+    if (c) {
+      const geo = coverGeometry(design, c);
+      const z = view.z;
+      c.anchors.forEach((a, i) => {
+        const w = wireById(design, a.wire);
+        if (!w) {
+          h += `<text x="20" y="${20 + i * 6}" font-size="5" fill="#c62828">锚点${i + 1} 导线缺失</text>`;
+          return;
+        }
+        const pts = resolvePath(design, w);
+        const L = polyLen(pts);
+        const s = Math.max(0, Math.min(L, +a.s || 0));
+        const q = pointAtArcOnPath(pts, s);
+        h += `<circle class="chandle" data-ci="${i}" cx="${q.x}" cy="${q.y}" r="${4.5 / z}"
+          fill="#ffd166" stroke="${coverKind(c.kind).color}" stroke-width="${1.2 / z}" style="cursor:grab"/>`;
+      });
+    }
   }
   // 布线预览
   if (ctx.drawing && ctx.drawing.pts.length) {

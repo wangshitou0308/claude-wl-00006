@@ -12,12 +12,14 @@ const state = {
   savedId: null,
   tool: 'select',
   spliceKind: 'cap', // 当前放置的拼接件类型
-  sel: { kind: null, id: null },       // kind: node|wire|zone
+  coverKind: 'corr', // 当前放置的包覆类型
+  sel: { kind: null, id: null },       // kind: node|wire|zone|cover
   view: { tx: 30, ty: 30, z: 1 },
-  opts: { snap: true, showBundles: true, showTies: false, showLabels: true },
+  opts: { snap: true, showBundles: true, showTies: false, showCovers: true, showLabels: true },
   drawing: null,   // 布线中 {from:{node,pin}, pts:[], cursor}
+  coverDraw: null, // 包覆绘制中 {kind, anchors:[{wire,s,node?}], pts:[], cursor}
   preview: null,   // 禁布区拖拽预览 {x,y,w,h}
-  step: null,      // 逐步推演 {active,steps,idx,confirmed:Set,locks:Set,lock}
+  step: null,      // 逐步推演 {active,steps,idx,confirmed:Set,coverDone:Set,locks:Set,lock}
   drag: null,
   epDrag: null,    // 拖接导线端 {wireId,side,start,cur,moved}
 };
@@ -26,7 +28,7 @@ const $ = id => document.getElementById(id);
 const canvas = $('canvas'), wrap = $('canvasWrap');
 const layers = {
   board: $('layer-board'), zone: $('layer-zone'), bundle: $('layer-bundle'),
-  wire: $('layer-wire'), tie: $('layer-tie'), node: $('layer-node'), overlay: $('layer-overlay'),
+  wire: $('layer-wire'), cover: $('layer-cover'), tie: $('layer-tie'), node: $('layer-node'), overlay: $('layer-overlay'),
 };
 const ctx = {
   get design() { return state.design; },
@@ -35,6 +37,7 @@ const ctx = {
   get opts() { return state.opts; },
   get step() { return state.step; },
   get drawing() { return state.drawing; },
+  get coverDraw() { return state.coverDraw; },
   get preview() { return state.preview; },
   get epDrag() { return state.epDrag; },
   layers,
@@ -119,9 +122,11 @@ function refreshAll() {
 function afterLoad() {
   state.sel = { kind: null, id: null };
   state.drawing = null;
+  state.coverDraw = null;
   state.step = null;       // 导入/载入新方案时退出任何逐步推演状态
   state.epDrag = null;
   $('stepBar').classList.add('hidden');
+  hideCoverBar();
   hidePinPicker();
   syncDataPanel();
   refreshAll();
@@ -168,6 +173,43 @@ function zoneAt(p) {
   }
   return null;
 }
+
+// 包覆命中：到任一已解析覆盖折线中线距离 < 半宽+容差
+function coverAt(p) {
+  const tol = 6 / state.view.z;
+  let best = null, bestD = tol;
+  for (const c of state.design.covers || []) {
+    const geo = M.coverGeometry(state.design, c);
+    for (const s of geo.seg) {
+      const half = (c.kind === 'tape' ? Math.max(2.2, s.diameter) : Math.max(c.innerD || 2, s.diameter)) / 2;
+      const d = M.pointSegDist(p, s.a, s.b);
+      if (d < bestD + half && d - half < bestD) { best = c; bestD = Math.max(0, d - half); }
+    }
+  }
+  return best;
+}
+
+// 找距离点最近的导线路径点，返回 {wire, s, point, d}（沿束段中心吸附）
+function nearestPathPoint(p, onlyWire = null) {
+  let best = null;
+  for (const w of state.design.wires) {
+    if (onlyWire && w.id !== onlyWire) continue;
+    const pts = M.resolvePath(state.design, w);
+    let acc = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const L = M.dist(a, b);
+      if (L < 0.01) { acc += L; continue; }
+      let t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / (L * L);
+      t = Math.max(0, Math.min(1, t));
+      const q = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+      const d = M.dist(p, q);
+      if (!best || d < best.d) best = { wire: w, s: acc + t * L, point: q, d };
+      acc += L;
+    }
+  }
+  return best;
+}
 function vertexAt(p) {
   if (state.sel.kind !== 'wire') return -1;
   const w = M.wireById(state.design, state.sel.id);
@@ -178,6 +220,22 @@ function vertexAt(p) {
     if (Math.hypot(p.x - pts[i].x, p.y - pts[i].y) <= tol) return i;
   }
   return -1;
+}
+
+// 选中包覆的路径锚点手柄
+function coverAnchorAt(p) {
+  if (state.sel.kind !== 'cover') return null;
+  const c = M.coverById(state.design, state.sel.id);
+  if (!c) return null;
+  const tol = 8 / state.view.z;
+  for (let i = 0; i < c.anchors.length; i++) {
+    const a = c.anchors[i];
+    const w = M.wireById(state.design, a.wire);
+    if (!w) continue;
+    const q = M.pointAtArcOnPath(M.resolvePath(state.design, w), a.s);
+    if (Math.hypot(p.x - q.x, p.y - q.y) <= tol) return { coverId: c.id, idx: i };
+  }
+  return null;
 }
 
 // 选中导线两端的可拖接手柄（拼接件端收到孔位点）
@@ -300,6 +358,11 @@ canvas.addEventListener('pointerdown', e => {
       state.drag = { type: 'vertex', idx: vi, ck: false };
       return;
     }
+    const cai = coverAnchorAt(p);
+    if (cai) {
+      state.drag = { type: 'coverAnchor', coverId: cai.coverId, idx: cai.idx, ck: false };
+      return;
+    }
     const eh = epHandleAt(p);
     if (eh) {
       state.epDrag = { wireId: state.sel.id, side: eh.side, start: { x: eh.x, y: eh.y }, cur: p, moved: false };
@@ -323,6 +386,12 @@ canvas.addEventListener('pointerdown', e => {
     const w = wireAt(p);
     if (w) {
       state.sel = { kind: 'wire', id: w.id };
+      refreshAll();
+      return;
+    }
+    const cv = coverAt(p);
+    if (cv) {
+      state.sel = { kind: 'cover', id: cv.id };
       refreshAll();
       return;
     }
@@ -357,6 +426,16 @@ canvas.addEventListener('pointerdown', e => {
   if (state.tool === 'zone') {
     state.drag = { type: 'zoneNew', x0: p.x, y0: p.y };
     state.preview = { x: p.x, y: p.y, w: 0, h: 0 };
+    return;
+  }
+
+  if (state.tool === 'cover') {
+    const hit = nearestPathPoint(p);
+    if (!hit) { setStatus('附近没有束段/导线，请把包覆起指点在已有走线上'); return; }
+    if (!state.coverDraw) {
+      state.coverDraw = { kind: state.coverKind, anchors: [], pts: [], cursor: null };
+    }
+    addCoverAnchor(hit);
     return;
   }
 
@@ -398,7 +477,7 @@ canvas.addEventListener('pointermove', e => {
   const d = state.drag;
   if (d) {
     // 首次实际移动时才记入撤销历史，避免选择操作污染撤销栈
-    if ((d.type === 'node' || d.type === 'zone' || d.type === 'vertex' || d.type === 'ep') && !d.ck) {
+    if ((d.type === 'node' || d.type === 'zone' || d.type === 'vertex' || d.type === 'ep' || d.type === 'coverAnchor') && !d.ck) {
       checkpoint();
       d.ck = true;
     }
@@ -428,6 +507,26 @@ canvas.addEventListener('pointermove', e => {
         w: Math.abs(p.x - d.x0), h: Math.abs(p.y - d.y0),
       };
       refreshCanvas();
+    } else if (d.type === 'coverAnchor') {
+      // 锚点沿所属导线滑动（保持路径锚点语义，改线后仍重算）
+      const c = M.coverById(state.design, d.coverId);
+      const a = c && c.anchors[d.idx];
+      const w = a && M.wireById(state.design, a.wire);
+      if (w) {
+        const pts = M.resolvePath(state.design, w);
+        let acc = 0, bestS = a.s, bestD = Infinity;
+        for (let i = 1; i < pts.length; i++) {
+          const L = M.dist(pts[i - 1], pts[i]);
+          let t = ((p.x - pts[i - 1].x) * (pts[i].x - pts[i - 1].x) + (p.y - pts[i - 1].y) * (pts[i].y - pts[i - 1].y)) / (L * L);
+          t = Math.max(0, Math.min(1, t));
+          const q = { x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t, y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t };
+          const dd = M.dist(p, q);
+          if (dd < bestD) { bestD = dd; bestS = acc + t * L; }
+          acc += L;
+        }
+        a.s = bestS;
+        refreshCanvas();
+      }
     }
     // 拖接导线端
     if (state.epDrag) {
@@ -441,6 +540,11 @@ canvas.addEventListener('pointermove', e => {
   }
   if (state.drawing) {
     state.drawing.cursor = snapPt(p);
+    refreshCanvas();
+  }
+  if (state.coverDraw) {
+    const hit = nearestPathPoint(p);
+    state.coverDraw.cursor = hit && hit.d <= COVER_SNAP / Math.min(1, state.view.z) ? hit.point : p;
     refreshCanvas();
   }
 });
@@ -465,7 +569,7 @@ canvas.addEventListener('pointerup', e => {
     }
     refreshAll();
   }
-  if (d.type === 'node' || d.type === 'zone' || d.type === 'vertex') {
+  if (d.type === 'node' || d.type === 'zone' || d.type === 'vertex' || d.type === 'coverAnchor') {
     refreshAll(); // 拖动结束后重算裁线表/检查
   }
   if (d.type === 'ep' && state.epDrag) {
@@ -492,6 +596,7 @@ canvas.addEventListener('pointerup', e => {
 });
 
 canvas.addEventListener('dblclick', e => {
+  if (state.coverDraw) { e.preventDefault(); finishCover(); return; }
   if (state.sel.kind !== 'wire') return;
   const w = M.wireById(state.design, state.sel.id);
   if (!w || w.locked) return;
@@ -512,6 +617,7 @@ canvas.addEventListener('dblclick', e => {
 
 canvas.addEventListener('contextmenu', e => {
   e.preventDefault();
+  if (state.coverDraw) { cancelCover(); return; }
   if (state.drawing) { state.drawing = null; setStatus('已取消布线'); refreshCanvas(); return; }
   const { sx, sy } = eventPos(e);
   const p = toWorld(sx, sy);
@@ -556,6 +662,73 @@ function applySpliceStrip(w, side) {
   if (sp) w.ends[side].strip = sp.strip;
 }
 
+// ---------- 包覆绘制 ----------
+
+const COVER_SNAP = 10; // 吸附到走线的容差（世界坐标，mm，另按缩放放宽）
+
+function addCoverAnchor(hit) {
+  const dr = state.coverDraw;
+  const tol = COVER_SNAP / Math.min(1, state.view.z);
+  if (hit.d > tol) { setStatus(`距走线 ${hit.d.toFixed(0)}mm 太远，请沿连续束段点取包覆起止`); return; }
+  const last = dr.anchors[dr.anchors.length - 1];
+  if (last && last.wire === hit.wire.id && Math.abs(last.s - hit.s) < 1) return; // 忽略重复点
+  if (last) {
+    // 连续性：换线时两锚点必须在同一物理位置（分支换线）
+    const lp = coverAnchorPoint(last);
+    if (hit.wire.id !== last.wire && M.dist(lp, hit.point) > M.COVER_MAX_JUMP) {
+      setStatus(`该处与上一锚点相距 ${M.dist(lp, hit.point).toFixed(0)}mm（> ${M.COVER_MAX_JUMP}mm），包覆不能跨越非连续束段`);
+      return;
+    }
+    // 同线回退（点到更靠近起点的位置）忽略，避免自交
+    if (hit.wire.id === last.wire && hit.s < last.s - 0.5) {
+      setStatus('请沿一个方向点取（退格可撤点）');
+      return;
+    }
+  }
+  dr.anchors.push({ wire: hit.wire.id, s: hit.s });
+  dr.pts.push(hit.point);
+  showCoverBar();
+  refreshCanvas();
+  setStatus(`包覆路径已取 ${dr.anchors.length} 个锚点：继续沿束段点取，双击或点上方「完成」结束（退格撤点、Esc 取消）`);
+}
+
+function coverAnchorPoint(a) {
+  const w = M.wireById(state.design, a.wire);
+  if (!w) return { x: 0, y: 0 };
+  return M.pointAtArcOnPath(M.resolvePath(state.design, w), a.s);
+}
+
+function showCoverBar() {
+  const dr = state.coverDraw;
+  if (!dr) return;
+  const kd = M.coverKind(dr.kind);
+  const bar = $('coverBar');
+  bar.innerHTML = `<span class="prog">${kd.name}包覆绘制</span>
+    <span>已取 ${dr.anchors.length} 个路径锚点</span>
+    <button id="cvOk" ${dr.anchors.length >= 2 ? '' : 'disabled'}>完成并设置参数</button>
+    <button id="cvUndo">撤点</button>
+    <button id="cvCancel">取消</button>`;
+  bar.classList.remove('hidden');
+  $('cvOk').onclick = finishCover;
+  $('cvUndo').onclick = () => { if (dr.anchors.length) { dr.anchors.pop(); dr.pts.pop(); showCoverBar(); refreshCanvas(); } };
+  $('cvCancel').onclick = cancelCover;
+}
+function hideCoverBar() { $('coverBar').classList.add('hidden'); $('coverBar').innerHTML = ''; }
+function cancelCover() { state.coverDraw = null; hideCoverBar(); refreshCanvas(); setStatus('已取消包覆绘制'); }
+
+function finishCover() {
+  const dr = state.coverDraw;
+  if (!dr || dr.anchors.length < 2) return setStatus('至少需要起、止两个锚点');
+  checkpoint();
+  const cover = M.makeCover(state.design, dr.kind, dr.anchors.map(a => ({ wire: a.wire, s: a.s })));
+  state.design.covers.push(cover);
+  state.coverDraw = null;
+  hideCoverBar();
+  state.sel = { kind: 'cover', id: cover.id };
+  refreshAll();
+  setStatus(`已建立${M.coverKind(cover.kind).name}包覆 ${cover.name}，请在属性面板设置材料规格、内径、搭接/节距与收口方式`);
+}
+
 // ---------- 工具与快捷键 ----------
 
 const TOOL_HINTS = {
@@ -566,16 +739,24 @@ const TOOL_HINTS = {
   splice: '点击画布放置拼接件（闭端/对接/超声焊）；布线时把导线端接到其孔位',
   zone: '按住拖出禁布区矩形',
   wire: '布线：点击连接器或拼接件选起点孔位 → 点击途经点 → 点击目标选终点孔位',
+  cover: '包覆：沿连续束段点击起止位（分支处可换线），双击或点「完成」结束；之后设置材料规格、内径、搭接/节距与收口',
 };
 function setTool(t, kind) {
   state.tool = t;
   if (t === 'splice' && kind) state.spliceKind = kind;
+  if (t === 'cover' && kind) state.coverKind = kind;
+  if (t !== 'cover') cancelCover();
   state.drawing = null;
   hidePinPicker();
-  document.querySelectorAll('#tools .tool').forEach(b =>
-    b.classList.toggle('active', b.dataset.tool === t && (t !== 'splice' || (b.dataset.kind || 'cap') === state.spliceKind)));
-  canvas.classList.toggle('wiretool', t === 'wire' || t === 'splice');
-  setStatus(t === 'splice' ? `放置${M.spliceKind(state.spliceKind).name}：点击画布；再用布线工具把导线端拖接到孔位` : TOOL_HINTS[t]);
+  document.querySelectorAll('#tools .tool').forEach(b => {
+    const on = b.dataset.tool === t &&
+      (t !== 'splice' || (b.dataset.kind || 'cap') === state.spliceKind) &&
+      (t !== 'cover' || (b.dataset.kind || 'corr') === state.coverKind);
+    b.classList.toggle('active', on);
+  });
+  canvas.classList.toggle('wiretool', t === 'wire' || t === 'splice' || t === 'cover');
+  if (t === 'cover') setStatus(`布置${M.coverKind(state.coverKind).name}：沿连续束段点击起、止位（双击/「完成」结束）`);
+  else setStatus(t === 'splice' ? `放置${M.spliceKind(state.spliceKind).name}：点击画布；再用布线工具把导线端拖接到孔位` : TOOL_HINTS[t]);
   refreshCanvas();
 }
 
@@ -585,7 +766,7 @@ $('zoomOut').onclick = () => { const r = wrap.getBoundingClientRect(); zoomAt(r.
 $('zoomFit').onclick = fitView;
 $('undoBtn').onclick = undo;
 $('redoBtn').onclick = redo;
-for (const [id, key] of [['optSnap', 'snap'], ['optBundles', 'showBundles'], ['optTies', 'showTies'], ['optLabels', 'showLabels']]) {
+for (const [id, key] of [['optSnap', 'snap'], ['optBundles', 'showBundles'], ['optTies', 'showTies'], ['optCovers', 'showCovers'], ['optLabels', 'showLabels']]) {
   $(id).onchange = e => { state.opts[key] = e.target.checked; refreshCanvas(); if (key === 'showTies') renderTies(); };
 }
 
@@ -596,10 +777,17 @@ document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
   if (e.key === 'Escape') {
     if (pinCb) return hidePinPicker();
+    if (state.coverDraw) { cancelCover(); return; }
     if (state.drawing) { state.drawing = null; setStatus('已取消布线'); return refreshCanvas(); }
     state.sel = { kind: null, id: null };
     return refreshAll();
   }
+  if (e.key === 'Backspace' && state.coverDraw) {
+    e.preventDefault();
+    if (state.coverDraw.anchors.length) { state.coverDraw.anchors.pop(); state.coverDraw.pts.pop(); showCoverBar(); refreshCanvas(); }
+    return;
+  }
+  if (e.key === 'Enter' && state.coverDraw && state.coverDraw.anchors.length >= 2) { e.preventDefault(); return finishCover(); }
   if (e.key === 'Backspace' && state.drawing) {
     e.preventDefault();
     if (state.drawing.pts.length > 1) state.drawing.pts.pop();
@@ -607,8 +795,8 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); deleteSelected(); return; }
   const k = e.key.toLowerCase();
-  const tools = { v: 'select', j: 'connector', b: 'branch', n: 'nail', z: 'zone', w: 'wire', s: 'splice' };
-  if (tools[k]) return setTool(tools[k], k === 's' ? state.spliceKind : undefined);
+  const tools = { v: 'select', j: 'connector', b: 'branch', n: 'nail', z: 'zone', w: 'wire', s: 'splice', c: 'cover' };
+  if (tools[k]) return setTool(tools[k], k === 's' ? state.spliceKind : k === 'c' ? state.coverKind : undefined);
   if (e.key.startsWith('Arrow') && state.sel.kind === 'node') {
     const n = M.nodeById(state.design, state.sel.id);
     if (!n) return;
@@ -628,8 +816,14 @@ function deleteSelected() {
     const w = M.wireById(state.design, id);
     if (!w) return;
     if (w.locked) return setStatus(`${w.label} 已锁定，请先在属性中解锁`);
+    const used = (state.design.covers || []).some(c => c.anchors.some(a => a.wire === id));
+    if (used && !confirm(`${w.label} 处于包覆路径上，删除后相关包覆的锚点会悬空（需重取）。仍要删除？`)) return;
     checkpoint();
     state.design.wires = state.design.wires.filter(x => x.id !== id);
+  } else if (kind === 'cover') {
+    if (!M.coverById(state.design, id)) return;
+    checkpoint();
+    state.design.covers = state.design.covers.filter(x => x.id !== id);
   } else if (kind === 'zone') {
     checkpoint();
     state.design.zones = state.design.zones.filter(x => x.id !== id);
@@ -826,6 +1020,8 @@ function renderProps() {
     return;
   }
 
+  if (kind === 'cover') return renderCoverProps();
+
   // 未选中：钉板与校验参数
   const b = d.board, s = d.settings;
   el.innerHTML = `<h4>钉板与参数</h4>
@@ -855,6 +1051,68 @@ function renderProps() {
   bind('s-toff', v => { s.tieOffset = Math.max(1, v || 15); });
 }
 
+// ---------- 包覆属性面板 ----------
+
+function renderCoverProps() {
+  const el = $('panel-prop');
+  const d = state.design;
+  const c = M.coverById(d, state.sel.id);
+  if (!c) { state.sel = { kind: null, id: null }; return renderProps(); }
+  const geo = M.coverGeometry(d, c);
+  const cut = M.coverCutInfo(d, c, geo);
+  const issues = M.validate(d).filter(i => i.cover === c.id);
+  const kd = M.coverKind(c.kind);
+  const locRows = c.anchors.map((a, i) => {
+    const w = M.wireById(d, a.wire);
+    const tail = i === 0 ? '起' : i === c.anchors.length - 1 ? '止' : '#' + (i + 1);
+    return `<tr><td>${tail}</td><td class="l">${w ? esc(w.label) : '<span style="color:#c62828">导线缺失</span>'}</td><td>${(+a.s || 0).toFixed(0)}</td></tr>`;
+  }).join('');
+  const isTape = c.kind === 'tape';
+  el.innerHTML = `<h4>${kd.glyph} ${kd.name} ${esc(c.name)}</h4>
+    <div class="grid2">
+      <label>名称 <input id="c-name" type="text" value="${esc(c.name)}"></label>
+      <label>类型 <select id="c-kind">${M.COVER_KINDS.map(k => `<option value="${k.id}" ${k.id === c.kind ? 'selected' : ''}>${k.name}</option>`).join('')}</select></label>
+      <label colspan="2">材料规格 <input id="c-spec" type="text" style="width:100%" value="${esc(c.spec)}" placeholder="如 PA阻燃波纹管 / PVC胶带"></label>
+      ${isTape ? '' : `<label>内径mm <input id="c-id" type="number" min="0" step="0.5" value="${c.innerD}"></label>
+        <label>层次 <input id="c-layer" type="number" min="1" max="9" value="${c.layer}"></label>
+        <label>接头搭接mm <input id="c-overlap" type="number" min="0" step="1" value="${c.overlap}"></label>`}
+      ${isTape ? `<label>胶带宽mm <input id="c-tapew" type="number" min="1" step="0.5" value="${c.tapeW}"></label>
+        <label>缠绕节距mm <input id="c-pitch" type="number" min="0.5" step="0.5" value="${c.pitch}"></label>
+        <label>搭接率% <input id="c-ovpct" type="number" min="0" max="90" step="5" value="${c.overlap}"></label>` : ''}
+      <label>分支收口 <select id="c-close">${M.COVER_CLOSE.map(x => `<option value="${x.id}" ${x.id === c.branchClose ? 'selected' : ''}>${x.name}</option>`).join('')}</select></label>
+    </div>
+    <div class="leninfo">
+      路径长 <b>${geo.length.toFixed(0)}mm</b> · 最大束径 ⌀${geo.maxD.toFixed(1)} ·
+      ${isTape
+        ? `有效节距 ${cut.pitch.toFixed(1)}mm · 用带 <b>${cut.cut.toFixed(0)}mm</b>（${(cut.cut / 1000).toFixed(2)}m）`
+        : `弯头累计 ${cut.bendDeg.toFixed(0)}° · 下料 <b>${cut.rounded}mm</b>`}
+    </div>
+    <table class="list"><thead><tr><th>锚点</th><th class="l">导线</th><th>弧长mm</th></tr></thead><tbody>${locRows}</tbody></table>
+    <p class="hint">起止：${esc(M.coverLocateText(d, c, 0))} → ${esc(M.coverLocateText(d, c, c.anchors.length - 1))}。拖动画布上的黄色锚点可沿线改位，改线后按路径锚点重算。</p>
+    ${issues.length ? `<div class="sub">本段问题</div>${issues.map(i =>
+      `<div class="issue ${i.level}">${{ error: '⛔', warn: '⚠️', info: 'ℹ️' }[i.level]} ${esc(i.msg)}</div>`).join('')}` : '<div class="okline">✓ 本段校验通过</div>'}
+    <div class="row btns"><button id="c-del">删除包覆</button></div>`;
+  $('c-name').onchange = e => { checkpoint(); c.name = e.target.value.trim() || c.name; refreshAll(); };
+  $('c-kind').onchange = e => {
+    checkpoint(); c.kind = e.target.value;
+    if (c.kind === 'tape') { c.overlap = 50; c.pitch = c.pitch || 12; c.tapeW = c.tapeW || 19; }
+    else if (!(c.innerD > 0)) { const g = M.coverGeometry(d, c); c.innerD = Math.ceil((g.maxD + 1) * 2) / 2; }
+    refreshAll();
+  };
+  $('c-spec').onchange = e => { checkpoint(); c.spec = e.target.value; refreshAll(); };
+  $('c-close').onchange = e => { checkpoint(); c.branchClose = e.target.value; refreshAll(); };
+  if (!isTape) {
+    $('c-id').onchange = e => { checkpoint(); c.innerD = Math.max(0, +e.target.value || 0); refreshAll(); };
+    $('c-layer').onchange = e => { checkpoint(); c.layer = Math.max(1, Math.min(9, +e.target.value || 1)); refreshAll(); };
+    $('c-overlap').onchange = e => { checkpoint(); c.overlap = Math.max(0, +e.target.value || 0); refreshAll(); };
+  } else {
+    $('c-tapew').onchange = e => { checkpoint(); c.tapeW = Math.max(1, +e.target.value || 19); refreshAll(); };
+    $('c-pitch').onchange = e => { checkpoint(); c.pitch = Math.max(0.5, +e.target.value || 12); refreshAll(); };
+    $('c-ovpct').onchange = e => { checkpoint(); c.overlap = Math.max(0, Math.min(90, +e.target.value || 0)); refreshAll(); };
+  }
+  $('c-del').onclick = deleteSelected;
+}
+
 // ---------- 检查面板 ----------
 
 function renderChecks() {
@@ -878,6 +1136,16 @@ function renderChecks() {
   el.querySelectorAll('.issue').forEach(div => {
     div.onclick = () => {
       const it = issues[+div.dataset.i];
+      if (it.cover) {
+        state.sel = { kind: 'cover', id: it.cover };
+        const c = M.coverById(state.design, it.cover);
+        if (c) {
+          const g = M.coverGeometry(state.design, c);
+          if (g.pts.length) centerOn({ x: g.pts[0].x, y: g.pts[0].y });
+        }
+        refreshAll();
+        return;
+      }
       if (it.wire) state.sel = { kind: 'wire', id: it.wire };
       else if (it.node) state.sel = { kind: 'node', id: it.node };
       else if (it.zone) state.sel = { kind: 'zone', id: it.zone };
@@ -917,6 +1185,39 @@ function renderCuts() {
       <td>${r.cut.toFixed(0)}</td><td><b>${r.rounded}</b></td></tr>`;
   }
   h += `</tbody></table>`;
+  // 包覆下料表
+  const covers = M.coverList(state.design);
+  if (covers.length) {
+    h += `<h4>包覆下料（波纹管 / 编织管 / 胶带）</h4><table class="list"><thead><tr>
+      <th class="l">编号</th><th class="l">材料</th><th class="l">规格</th><th>内径</th><th>束径max</th>
+      <th>路径</th><th>下料/用带</th><th class="l">起 → 止</th><th>状态</th></tr></thead><tbody>`;
+    for (const cv of covers) {
+      const bad = cv.broken || cv.dangling;
+      h += `<tr data-cv="${cv.id}" style="cursor:pointer" class="${state.sel.kind === 'cover' && state.sel.id === cv.id ? 'cur' : ''}">
+        <td class="l"><b>${esc(cv.glyph)}${esc(cv.name)}</b><br><span style="color:#888;font-size:10px">${esc(cv.kindName)}·${cv.layer}层</span></td>
+        <td class="l">${esc(cv.kindName)}</td>
+        <td class="l">${esc(cv.spec || '—')}</td>
+        <td>${cv.kind === 'tape' ? '—' : '⌀' + cv.innerD}</td>
+        <td>⌀${cv.maxD.toFixed(1)}</td>
+        <td>${cv.length.toFixed(0)}</td>
+        <td><b>${cv.kind === 'tape' ? cv.cut.toFixed(0) + 'mm' : cv.rounded + 'mm'}</b></td>
+        <td class="l" style="white-space:normal">${esc(cv.start)} → ${esc(cv.end)}</td>
+        <td>${bad ? '⚠️' : '✓'}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+    const cmats = M.coverMaterialSummary(state.design);
+    if (cmats.length) {
+      h += `<h4>包覆用料汇总</h4><table class="list"><thead><tr><th class="l">材料</th><th class="l">规格/参数</th><th>段数</th><th>总量</th></tr></thead><tbody>`;
+      for (const m of cmats) {
+        h += `<tr><td class="l">${esc(m.name)}</td>
+          <td class="l">${m.kind === 'tape'
+            ? esc(m.spec) + ` 宽${m.width} 节距${m.pitch.toFixed(1)}`
+            : esc(m.spec) + ` ⌀${m.innerD}`}</td>
+          <td>${m.count}</td><td><b>${(m.total / 1000).toFixed(2)} m</b></td></tr>`;
+      }
+      h += `</tbody></table>`;
+    }
+  }
   const spl = M.spliceList(state.design);
   if (spl.length) {
     h += `<h4>拼接件（集线→压接→套管）</h4><table class="list"><thead><tr>
@@ -955,6 +1256,12 @@ function renderCuts() {
     if (w) { const pts = M.resolvePath(state.design, w); centerOn(pts[Math.floor(pts.length / 2)]); }
     refreshAll();
   }));
+  el.querySelectorAll('tr[data-cv]').forEach(tr => (tr.onclick = () => {
+    state.sel = { kind: 'cover', id: tr.dataset.cv };
+    const g = M.coverGeometry(state.design, M.coverById(state.design, tr.dataset.cv));
+    if (g.pts.length) centerOn({ x: g.pts[0].x, y: g.pts[0].y });
+    refreshAll();
+  }));
 }
 
 // ---------- 绑扎面板 ----------
@@ -990,7 +1297,8 @@ function renderAsm() {
     let cls = '', body = '';
     if (st && st.active) {
       if (s.kind === 'wire') cls = st.confirmed.has(s.wireId) ? 'done' : st.idx === i ? 'cur' : '';
-      else cls = st.spliceDone.has(s.spliceId) ? 'done' : st.idx === i ? 'cur' : '';
+      else if (s.kind === 'splice') cls = st.spliceDone.has(s.spliceId) ? 'done' : st.idx === i ? 'cur' : '';
+      else cls = st.coverDone.has(`${s.coverId}:${s.phase}`) ? 'done' : st.idx === i ? 'cur' : '';
     }
     if (s.kind === 'wire') {
       const w = M.wireById(state.design, s.wireId);
@@ -999,6 +1307,13 @@ function renderAsm() {
         <span class="asmname">${esc(s.label)}${s.locked ? ' 🔒' : ''}</span>
         <span style="color:#777">${s.length.toFixed(0)}mm</span>
         <span style="color:#999;font-size:11px">主干 ${s.shared.toFixed(0)}mm</span>`;
+    } else if (s.kind === 'cover') {
+      const kd = M.coverKind(s.cover.kind);
+      body = `<span class="no">${i + 1}</span>
+        <span class="covertag" style="border-color:${kd.color};color:${kd.color}">${kd.glyph}</span>
+        <span class="asmname">${esc(s.label)}</span>
+        ${s.blocked ? '<span style="color:#c62828;font-size:11px">压接前预套</span>' : ''}
+        <span style="color:#888;font-size:11px">${s.phaseName}</span>`;
     } else {
       const kd = M.spliceKind(s.splice.kind);
       let statusH;
@@ -1016,10 +1331,12 @@ function renderAsm() {
         <span class="asmname">${esc(s.label)}（集线→压接→套管）</span>
         ${statusH}`;
     }
-    const dataAttr = s.kind === 'wire' ? `data-w="${s.wireId}"` : `data-sp="${s.spliceId}"`;
+    const dataAttr = s.kind === 'wire' ? `data-w="${s.wireId}"`
+      : s.kind === 'cover' ? `data-cover-step="${i}"`
+      : `data-sp="${s.spliceId}"`;
     return `<div class="asmitem ${cls}" ${dataAttr}>${body}</div>`;
   }).join('') + '</div>';
-  h += '<p class="hint">先逐根送线（主干优先），再按拼接件引导集线、压接、套管确认；拼接件未接齐不得完成。</p>';
+  h += '<p class="hint">先逐根送线（主干优先）；穿不过已装端头的套管在压接前裁套/预套；再按拼接件压接，随后套装、收口、缠带逐项确认。</p>';
   el.innerHTML = h;
   if (st && st.active) $('asmStop').onclick = stopStep;
   else {
@@ -1033,9 +1350,11 @@ function renderAsm() {
     refreshAll();
   };
   el.querySelectorAll('.asmitem').forEach(div => (div.onclick = () => {
-    if (div.dataset.w) state.sel = { kind: 'wire', id: div.dataset.w };
-    else if (div.dataset.sp) state.sel = { kind: 'node', id: div.dataset.sp };
-    refreshAll();
+    if (div.dataset.w) { state.sel = { kind: 'wire', id: div.dataset.w }; refreshAll(); }
+    else if (div.dataset.sp) { state.sel = { kind: 'node', id: div.dataset.sp }; refreshAll(); }
+    else if (div.dataset.coverStep !== undefined && state.step && state.step.active) {
+      selectStep(+div.dataset.coverStep); refreshAll();
+    }
   }));
 }
 
@@ -1046,14 +1365,14 @@ function startStep() {
   checkpoint(); // 推演中的锁定可一次撤销
   state.step = {
     active: true, steps, idx: 0,
-    confirmed, spliceDone: new Set(),
+    confirmed, spliceDone: new Set(), coverDone: new Set(),
     locks: new Set(state.design.wires.filter(w => w.locked).map(w => w.id)),
     lock: $('asmLock') ? $('asmLock').checked : true,
   };
   setTool('select');
   selectStep(0);
   $('stepBar').classList.remove('hidden');
-  setStatus('逐步推演：先逐根送线，再按拼接件集线/压接/套管确认');
+  setStatus('逐步推演：送线 →（必要时压接前预套）→ 拼接压接 → 套装/收口/缠带确认');
   refreshAll();
 }
 function stopStep() {
@@ -1070,6 +1389,10 @@ function selectStep(i) {
     state.sel = { kind: 'wire', id: s.wireId };
     const w = M.wireById(state.design, s.wireId);
     if (w) { const pts = M.resolvePath(state.design, w); centerOn(pts[Math.floor(pts.length / 2)]); }
+  } else if (s.kind === 'cover') {
+    state.sel = { kind: 'cover', id: s.coverId };
+    const m = s.geo && s.geo.pts[Math.floor(s.geo.pts.length / 2)];
+    if (m) centerOn(m);
   } else {
     state.sel = { kind: 'node', id: s.spliceId };
     centerOn(s.splice);
@@ -1124,6 +1447,12 @@ function renderStepBar() {
     $('stGather').onclick = () => { st.phase = Math.max(st.phase || 0, 1); setStatus(`已集线：核对 ${labels}`); };
     $('stCrimp').onclick = () => {
       if ((st.phase || 0) < 1) return setStatus('请先确认集线');
+      // 穿不过已装端头的套管：其裁套/预套必须已确认，才能压接
+      const pending = (s.preCovers || []).filter(c =>
+        !st.coverDone.has(`${c.id}:preslip`) || !st.coverDone.has(`${c.id}:cut`));
+      if (pending.length) {
+        return setStatus(`压接前请先完成套管预套：${pending.map(c => M.coverKind(c.kind).name + ' ' + c.name).join('、')}（裁套/预套步骤在本件之前）`);
+      }
       st.phase = 2; setStatus(`${sp.name} 已${sp.kind === 'ultra' ? '超声焊接' : '压接'}`);
     };
     $('stSleeve').onclick = () => {
@@ -1136,20 +1465,56 @@ function renderStepBar() {
       st.phase = 0;
       advance();
     };
+  } else if (s.kind === 'cover') {
+    const c = s.cover, kd = M.coverKind(c.kind);
+    const key = `${c.id}:${s.phase}`;
+    const done = st.coverDone.has(key);
+    // 该包覆先前阶段是否都已确认（收口/缠带必须在裁切、套装之后）
+    const order = { cut: 1, preslip: 1, fit: 1, close: 2, tape: 2 };
+    const prevKeys = (s.phase === 'close' || s.phase === 'tape')
+      ? st.steps.filter(x => x.kind === 'cover' && x.coverId === c.id && order[x.phase] === 1)
+      : [];
+    const prevOk = prevKeys.every(x => st.coverDone.has(`${c.id}:${x.phase}`));
+    const cutLen = s.cut.rounded ?? Math.ceil(s.cut.cut);
+    let detail = '';
+    if (s.phase === 'cut') detail = `下料 ${cutLen}mm · 最大束径 ⌀${s.geo.maxD.toFixed(1)}${c.innerD ? ' · 内径 ⌀' + c.innerD : ''}`;
+    else if (s.phase === 'preslip') detail = `套到 ${M.nodeName(d, s.gateNode)} 一侧待压接的导线上，压接后再回拉就位`;
+    else if (s.phase === 'fit') detail = `沿路径套装 ${s.geo.length.toFixed(0)}mm`;
+    else if (s.phase === 'close') detail = `分支收口：${M.COVER_CLOSE.find(x => x.id === c.branchClose)?.name}`;
+    else detail = `带宽 ${c.tapeW}mm · 节距 ${s.cut.pitch.toFixed(1)}mm · 用带 ${s.cut.cut.toFixed(0)}mm`;
+    bar.innerHTML = `<span class="prog">包覆 第 ${st.idx + 1}/${st.steps.length} 步</span>
+      <span class="cur">${kd.glyph} ${esc(c.name)} · ${s.phaseName}</span>
+      <span style="color:#666">${esc(detail)}</span>
+      <button id="stPrev" ${st.idx === 0 ? 'disabled' : ''}>上一步</button>
+      <button id="stOk" ${done || !prevOk ? 'disabled' : ''}>${s.phaseName}确认</button>
+      <button id="stWithdraw" ${done ? '' : 'disabled'}>撤回本步</button>
+      <button id="stExit">退出</button>`;
+    if (!prevOk && !done) setStatus(`请先确认 ${c.name} 的裁切/预套步骤`);
+    $('stOk').onclick = () => { st.coverDone.add(key); advance(); };
+    $('stWithdraw').onclick = () => { st.coverDone.delete(key); renderAllStep(); };
   }
   const prev = $('stPrev');
   if (prev) prev.onclick = () => selectStep(st.idx - 1);
   const ex = $('stExit'); if (ex) ex.onclick = stopStep;
 }
+
+function renderAllStep() {
+  renderStepBar();
+  renderAsm();
+  refreshCanvas();
+}
 function advance() {
   const st = state.step;
   selectStep(st.idx + 1);
   const cur = st.steps[st.idx];
-  const done = cur.kind === 'wire' ? st.confirmed.has(cur.wireId) : st.spliceDone.has(cur.spliceId);
+  const done = cur.kind === 'wire' ? st.confirmed.has(cur.wireId)
+    : cur.kind === 'splice' ? st.spliceDone.has(cur.spliceId)
+    : st.coverDone.has(`${cur.coverId}:${cur.phase}`);
   if (done) {
     const ns = st.steps.filter(s => s.kind === 'splice').length;
+    const nc = st.steps.filter(s => s.kind === 'cover').length;
     stopStep();
-    setStatus(`装配推演完成：${st.confirmed.size} 根导线已送线确认，${ns} 个拼接件已集线/压接/套管确认`);
+    setStatus(`装配推演完成：${st.confirmed.size} 根导线送线、${ns} 个拼接件压接、${nc} 项包覆裁切/套装/收口/缠带确认`);
     return;
   }
   refreshAll();

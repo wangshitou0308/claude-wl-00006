@@ -1,7 +1,7 @@
 // model.js — 线束钉板数据模型与纯计算逻辑（无 DOM 依赖，可在 Node 中单元测试）
 'use strict';
 
-export const VERSION = 2;
+export const VERSION = 3;
 
 export const WIRE_COLORS = [
   ['#d62728', '红'], ['#ff7f0e', '橙'], ['#f2c200', '黄'], ['#2ca02c', '绿'],
@@ -31,6 +31,32 @@ export const spliceKind = k => SPLICE_KINDS.find(x => x.id === k) || SPLICE_KIND
 // 闭端帽线径组合上限：最大/最小外径比不宜超过该值（粗线顶不到帽底、细线压不紧）
 export const CAP_GAUGE_RATIO = 1.6;
 
+// ---------- 包覆材料：波纹管 / 编织套管 / 胶带缠绕 ----------
+
+export const COVER_KINDS = [
+  { id: 'corr', name: '波纹管', glyph: '〰', color: '#ef6c00', wall: 1.2 },
+  { id: 'braid', name: '编织套管', glyph: '⫷', color: '#6d4c41', wall: 0.8 },
+  { id: 'tape', name: '胶带缠绕', glyph: '🩹', color: '#283593', wall: 0.35 },
+];
+export const coverKind = k => COVER_KINDS.find(x => x.id === k) || COVER_KINDS[0];
+
+// 分支收口方式：胶带收口 / 套管剖开缠收口 / 不处理（露线）
+export const COVER_CLOSE = [
+  { id: 'seal', name: '胶带收口' },
+  { id: 'split', name: '剖开收口' },
+  { id: 'none', name: '不处理（露线）' },
+];
+
+// 锚点沿导线路径的最大悬空（导线删除/被截短后）与跨线最大间隙
+export const COVER_MAX_DANGLING = 20;
+export const COVER_MAX_JUMP = 12;
+// 相邻包覆层壁厚叠加后内径不足的判定余量
+export const COVER_WALL_GAP = 0.5;
+// 端头/拼接件收口安全间隙（mm）
+export const COVER_END_GAP = 2;
+// 可视为包覆内部经过（而非收口）的节点距离
+export const COVER_NEAR_NODE = 1.5;
+
 let _uid = 1;
 export function uid(prefix = 'id') {
   return `${prefix}_${Date.now().toString(36)}_${(_uid++).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -54,6 +80,7 @@ export function createDesign(name = '未命名线束') {
     zones: [],   // {id,x,y,w,h,name}
     wires: [],   // {id,label,gauge,color,from:{node,pin},to:{node,pin},path:[{x,y,node?}],locked,ends:{from:{strip,crimp,service},to:{...}}}
     nets: [],    // 接线表 {name,endpoints:['J1.1','J2.3',...]}；旧版 {label,from,to} 仍可读
+    covers: [],  // 包覆段（波纹管/编织套管/胶带缠绕）：见 makeCover
   };
 }
 
@@ -65,6 +92,7 @@ export function migrateDesign(d) {
   d.zones = Array.isArray(d.zones) ? d.zones : [];
   d.wires = Array.isArray(d.wires) ? d.wires : [];
   d.nets = Array.isArray(d.nets) ? d.nets : [];
+  d.covers = Array.isArray(d.covers) ? d.covers : [];
   for (const n of d.nodes) {
     if (n.type === 'splice') {
       n.kind = SPLICE_KINDS.some(k => k.id === n.kind) ? n.kind : 'cap';
@@ -80,6 +108,16 @@ export function migrateDesign(d) {
     if (!w.ends) w.ends = defaultEnds();
     w.ends.from = w.ends.from || { strip: 5, crimp: '', service: 20 };
     w.ends.to = w.ends.to || { strip: 5, crimp: '', service: 20 };
+  }
+  for (const c of d.covers) {
+    if (!COVER_KINDS.some(k => k.id === c.kind)) c.kind = 'corr';
+    if (!COVER_CLOSE.some(k => k.id === c.branchClose)) c.branchClose = 'seal';
+    if (!(c.innerD > 0)) c.innerD = 0;
+    if (!(c.overlap >= 0)) c.overlap = 0;
+    if (!(c.pitch > 0)) c.pitch = 0;
+    if (!(c.tapeW > 0)) c.tapeW = 19;
+    if (!(c.layer >= 1)) c.layer = 1;
+    if (!Array.isArray(c.anchors)) c.anchors = [];
   }
   return d;
 }
@@ -106,6 +144,353 @@ export function makeSplice(x, y, name, kind = 'cap', ports = 4) {
 
 export function makeZone(x, y, w, h, name) {
   return { id: uid('z'), x, y, w, h, name: name || '禁布区' };
+}
+
+// ---------- 包覆段（波纹管 / 编织套管 / 胶带缠绕） ----------
+//
+// 包覆沿“连续路径”布置：anchors 为有序路径锚点 [{wire, s}]，s 是从该导线起点
+// 沿解析路径的弧长(mm)。节点被拖动或改线后，锚点仍按 (导线, 弧长) 重新解析，
+// 而非存死坐标；相邻锚点可落在不同导线上（分支处换线），系统检查两锚点处是否
+// 处于同一物理位置。kind=tape 时 innerD 可为 0；pitch/tapeW 为缠绕参数。
+export function makeCover(design, kind = 'corr', anchors = []) {
+  const c = {
+    id: uid('c'),
+    name: nextCoverName(design),
+    kind,
+    spec: '',                 // 材料规格（自由文本）
+    innerD: 0,                // 内径 mm（胶带可为 0）
+    overlap: kind === 'tape' ? 50 : 10, // 胶带=搭接率%；套管=接头搭接 mm
+    pitch: kind === 'tape' ? 12 : 0,    // 缠绕节距 mm（胶带）
+    tapeW: 19,                // 胶带宽度 mm
+    branchClose: 'seal',      // 分支收口：seal 胶带 / split 剖开 / none 露线
+    layer: 1,                 // 包覆层次（1 最内）
+    anchors,
+  };
+  if (!c.innerD) {
+    const g = coverGeometry(design, c);
+    if (g.maxD > 0) c.innerD = Math.ceil((g.maxD + 1) * 2) / 2;
+  }
+  return c;
+}
+
+export function nextCoverName(design) {
+  const used = new Set((design.covers || []).map(c => c.name));
+  for (let i = 1; i < 1000; i++) {
+    const nm = 'C' + i;
+    if (!used.has(nm)) return nm;
+  }
+  return 'C' + Date.now();
+}
+
+export function coverById(design, id) {
+  return (design.covers || []).find(c => c.id === id) || null;
+}
+
+// 沿折线在弧长 s 处取点（含切线方向）
+export function pointAtArcOnPath(pts, s) {
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const L = dist(pts[i - 1], pts[i]);
+    if (acc + L >= s - 1e-9 || i === pts.length - 1) {
+      const t = L > 0 ? Math.max(0, Math.min(1, (s - acc) / L)) : 0;
+      return {
+        x: pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t,
+        y: pts[i - 1].y + (pts[i].y - pts[i - 1].y) * t,
+        ux: (pts[i].x - pts[i - 1].x) / (L || 1),
+        uy: (pts[i].y - pts[i - 1].y) / (L || 1),
+      };
+    }
+    acc += L;
+  }
+  const p = pts[pts.length - 1];
+  return { x: p.x, y: p.y, ux: 0, uy: 0 };
+}
+
+function pointAtArc(pts, s) { return pointAtArcOnPath(pts, s); }
+
+// 同一折线 [s0,s1] 子段
+function subPolyline(pts, s0, s1) {
+  if (s1 < s0) { const t = s0; s0 = s1; s1 = t; }
+  const out = [pointAtArc(pts, s0)];
+  let acc = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const L = dist(pts[i - 1], pts[i]);
+    if (acc + L > s0 && acc < s1) {
+      const lo = Math.max(acc, s0), hi = Math.min(acc + L, s1);
+      if (lo > acc + 1e-6) out.push(pointAtArc(pts, lo));
+      if (hi < acc + L - 1e-6) out.push(pointAtArc(pts, hi));
+    }
+    acc += L;
+  }
+  out.push(pointAtArc(pts, s1));
+  // 去重相邻点
+  return out.filter((p, i) => i === 0 || dist(p, out[i - 1]) > 1e-6);
+}
+
+// 点所在的重合束段：沿束段中线投影落在区间内且法向偏移 ≤0.5mm。
+// 同一束段的多条导线共线但法向有微差，故按“点到束段中线的投影+垂距”判定，
+// 而非要求采样点恰好落在中线上。
+function bundleAtPoint(bundles, p) {
+  let best = null, bestD = 0.5;
+  for (const b of bundles) {
+    const L = dist(b.a, b.b);
+    if (L < 0.01) continue;
+    const ux = (b.b.x - b.a.x) / L, uy = (b.b.y - b.a.y) / L;
+    const t = (p.x - b.a.x) * ux + (p.y - b.a.y) * uy;
+    if (t < -0.5 || t > L + 0.5) continue;
+    const nx = -uy, ny = ux;
+    const off = Math.abs((p.x - b.a.x) * nx + (p.y - b.a.y) * ny);
+    if (off <= bestD) { bestD = off; best = b; }
+  }
+  return best;
+}
+
+// 子段折线上的最大/最小束径（采样每 5mm 一点），及首点所在束段的导线集合
+function subBundleStats(bundles, sub) {
+  let maxD = 0, minD = Infinity, wires = null;
+  const total = polyLen(sub);
+  const nPts = Math.max(1, Math.ceil(total / 5));
+  for (let t = 0; t <= nPts; t++) {
+    const s = total * t / nPts;
+    const p = pointAtArc(sub, s);
+    const b = bundleAtPoint(bundles, p);
+    if (b) {
+      maxD = Math.max(maxD, b.diameter);
+      minD = Math.min(minD, b.diameter);
+      if (!wires) wires = b.wires.slice();
+    }
+  }
+  if (!wires) return null;
+  return { maxD, minD, wires };
+}
+
+// 解析包覆几何：把锚点链展开为连续折线 + 逐子段束径/弯曲/节点信息。
+// 返回 {ok, pts, seg:[{a,b,wires,diameter,from,to,jump}], length, maxD, minD,
+//   bends:[{p,angle,deg}], broken:[{i,reason}], dangling:[{i}], start,end, nodes:[...]}
+export function coverGeometry(design, cover) {
+  const bundles = computeBundles(design);
+  const resolved = [];
+  const dangling = [];
+  (cover.anchors || []).forEach((a, i) => {
+    const w = wireById(design, a.wire);
+    if (!w) { dangling.push({ i, reason: '导线已删除' }); return; }
+    const pts = resolvePath(design, w);
+    const L = polyLen(pts);
+    let s = +a.s;
+    if (!Number.isFinite(s)) s = 0;
+    let over = null;
+    if (s < 0) { over = '锚点超出导线起点'; s = 0; }
+    if (s > L + COVER_MAX_DANGLING) over = '锚点超出导线终点';
+    s = Math.max(0, Math.min(L, s));
+    const p = pointAtArc(pts, s);
+    resolved.push({ i, wire: w, s, L, p, pts, over });
+    if (over) dangling.push({ i, reason: over });
+  });
+
+  const broken = [];
+  const seg = [];
+  const pts = [];
+  for (let k = 0; k < resolved.length; k++) {
+    const r = resolved[k];
+    if (pts.length === 0) pts.push({ x: r.p.x, y: r.p.y });
+    if (k === resolved.length - 1) break;
+    const n = resolved[k + 1];
+    const same = r.wire.id === n.wire.id;
+    let sub = [];
+    let jump = 0;
+    if (same) {
+      sub = subPolyline(r.pts, r.s, n.s);
+    } else {
+      // 跨导线：两锚点应处于同一物理位置（分支换线）；以各自锚点直连
+      jump = dist(r.p, n.p);
+      sub = [r.p, n.p];
+      if (jump > COVER_MAX_JUMP) broken.push({ i: k, reason: `跨线间隙 ${jump.toFixed(1)}mm` });
+    }
+    // 子段各点束径（沿中线采样）
+    let maxD = 0, minD = Infinity, wires = null;
+    const stats = subBundleStats(bundles, sub);
+    if (stats) ({ maxD, minD, wires } = stats);
+    if (!wires) {
+      // 束段表中找不到（极短/零长）时退化为该导线单径
+      const D = (design.settings.packFactor || 1.2) * r.wire.gauge;
+      maxD = minD = D; wires = [r.wire.id];
+    }
+    for (let j = 1; j < sub.length; j++) {
+      seg.push({ a: sub[j - 1], b: sub[j], wires: wires.slice(), diameter: maxD, from: r.wire.id, to: n.wire.id, jump });
+      pts.push({ x: sub[j].x, y: sub[j].y });
+    }
+  }
+
+  // 折线总长度与拐点
+  let length = 0;
+  for (const s of seg) length += dist(s.a, s.b);
+  const bends = [];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const L1 = dist(pts[i - 1], pts[i]), L2 = dist(pts[i], pts[i + 1]);
+    if (L1 < 0.5 || L2 < 0.5) continue;
+    const dot = ((pts[i - 1].x - pts[i].x) * (pts[i + 1].x - pts[i].x) +
+                 (pts[i - 1].y - pts[i].y) * (pts[i + 1].y - pts[i].y)) / (L1 * L2);
+    const ang = Math.PI - Math.acos(Math.max(-1, Math.min(1, dot)));
+    if (ang >= 0.087) bends.push({ p: pts[i], angle: ang, deg: ang * 180 / Math.PI });
+  }
+
+  // 路径内部经过的节点（分支点/拼接件/连接器）。
+  // 束段中线相对折线顶点可能有微差，故沿锚点导线的真实解析路径逐段判断。
+  const endNodeIds = new Set();
+  const startNode = nearestNodeAt(design, pts[0]), endNode = nearestNodeAt(design, pts[pts.length - 1]);
+  if (startNode && dist(pts[0], startNode) <= COVER_NEAR_NODE) endNodeIds.add(startNode.id);
+  if (endNode && dist(pts[pts.length - 1], endNode) <= COVER_NEAR_NODE) endNodeIds.add(endNode.id);
+  const nodes = [];
+  const addNode = node => { if (node && !endNodeIds.has(node.id) && !nodes.some(x => x.id === node.id)) nodes.push(node); };
+  // 相邻锚点同线：扫该导线 [s0,s1] 弧长区间；跨线/单锚点：仅判断锚点处
+  const coveredArcs = new Map(); // resolved 索引 → [[lo,hi]]
+  for (let k = 0; k < resolved.length; k++) {
+    const r = resolved[k], wins = [];
+    if (k > 0 && resolved[k - 1].wire.id === r.wire.id) wins.push([resolved[k - 1].s, r.s]);
+    if (k < resolved.length - 1 && resolved[k + 1].wire.id === r.wire.id) wins.push([r.s, resolved[k + 1].s]);
+    if (!wins.length) wins.push([r.s, r.s]);
+    let acc = 0;
+    for (let i = 1; i < r.pts.length; i++) {
+      const L = dist(r.pts[i - 1], r.pts[i]);
+      const hit = wins.some(([a, b]) => Math.min(a, b) <= acc + L + 1e-6 && Math.max(a, b) >= acc - 1e-6);
+      if (hit) for (const node of design.nodes) if (pointSegDist(node, r.pts[i - 1], r.pts[i]) <= COVER_NEAR_NODE) addNode(node);
+      acc += L;
+    }
+  }
+
+  const diameters = seg.map(s => s.diameter);
+  return {
+    ok: broken.length === 0,
+    pts, seg, length, broken, dangling,
+    maxD: diameters.length ? Math.max(...diameters) : 0,
+    minD: diameters.length ? Math.min(...diameters.filter(x => Number.isFinite(x))) : 0,
+    bends,
+    nodes,
+    startNode: startNode && dist(pts[0], startNode) <= COVER_NEAR_NODE + 0.5 ? startNode : null,
+    endNode: endNode && dist(pts[pts.length - 1], endNode) <= COVER_NEAR_NODE + 0.5 ? endNode : null,
+    startNodeNear: startNode, endNodeNear: endNode,
+  };
+}
+
+function nearestNodeAt(design, p) {
+  let best = null, bd = Infinity;
+  for (const n of design.nodes) {
+    const d = dist(n, p);
+    if (d < bd) { bd = d; best = n; }
+  }
+  return best;
+}
+
+// 已装端头外形尺寸（判断套管能否穿过）：连接器取本体高度，拼接件取保护套外径/本体
+export function endPassDim(design, node) {
+  if (!node) return 0;
+  if (node.type === 'connector') return 18;
+  if (node.type === 'splice') return Math.max(node.sleeveD || 0, node.kind === 'butt' ? 8 : 10);
+  return 0;
+}
+
+// 包覆下料核算：
+//  波纹管/编织管：下料 = 路径长 + 弯头裕量 + 分支裕量 + 接头搭接
+//  胶带：带长 = Σ π·(束径+带厚) × 带宽 / 有效节距（搭接率换算），
+//        另加分支收口带；返回有效节距与总用量。
+export function coverCutInfo(design, cover, geo) {
+  geo = geo || coverGeometry(design, cover);
+  const bendDeg = geo.bends.reduce((a, b) => a + b.deg, 0);
+  // 分支收口只针对显式分支点；拼接件/固定钉的引出不计分支露线
+  const branchCount = geo.nodes.filter(n => n.type === 'branch').length;
+  const joints = 1;
+  const isTape = cover.kind === 'tape';
+
+  if (isTape) {
+    const ov = Math.max(0, Math.min(90, cover.overlap || 0)) / 100;
+    const w = Math.max(1, cover.tapeW || 19);
+    const pitch = cover.pitch > 0 ? cover.pitch : w * (1 - ov);
+    // 半叠绕 pitch = w/2；有效前进节距不得小于带宽 10%
+    const effPitch = Math.max(w * 0.1, pitch);
+    let tape = 0;
+    for (const s of geo.seg) {
+      const L = dist(s.a, s.b);
+      const wraps = L / effPitch;
+      tape += wraps * Math.PI * (s.diameter + coverKind('tape').wall);
+    }
+    const branchCount = geo.nodes.filter(n => n.type === 'branch').length;
+    const seal = cover.branchClose === 'seal' ? branchCount * 3 * w : 0;
+    const ends = 2 * 1.5 * w; // 两端封口
+    return {
+      kind: 'tape', length: geo.length, cut: tape + seal + ends, unit: 'mm',
+      pitch: effPitch, overlapPct: ov, tapeW: w, branchCount, bendDeg, joints,
+      seal, ends,
+    };
+  }
+
+  const bendAllow = bendDeg / 360 * 0.12 * geo.length; // 每 360° 累计转角 +12%
+  const branchAllow = branchCount * (cover.branchClose === 'split' ? 25 : cover.branchClose === 'seal' ? 35 : 0);
+  const overlapMm = Math.max(0, cover.overlap || 0);
+  const cut = geo.length + bendAllow + branchAllow + joints * overlapMm;
+  return {
+    kind: cover.kind, length: geo.length, cut, unit: 'mm', rounded: Math.ceil(cut),
+    bendDeg, bendAllow, branchCount, branchAllow, joints, overlap: overlapMm,
+  };
+}
+
+// 包覆清单（下料/打印/用料用）
+export function coverList(design) {
+  return (design.covers || []).map(c => {
+    const geo = coverGeometry(design, c);
+    const cut = coverCutInfo(design, c, geo);
+    const startText = coverLocateText(design, c, 0), endText = coverLocateText(design, c, (c.anchors || []).length - 1);
+    return {
+      id: c.id, name: c.name, kind: c.kind, kindName: coverKind(c.kind).name,
+      glyph: coverKind(c.kind).glyph, spec: c.spec, innerD: c.innerD,
+      overlap: c.overlap, pitch: c.pitch, tapeW: c.tapeW,
+      branchClose: c.branchClose, layer: c.layer,
+      length: geo.length, maxD: geo.maxD, broken: geo.broken.length, dangling: geo.dangling.length,
+      bends: geo.bends.length, bendDeg: cut.bendDeg || 0,
+      branchCount: cut.branchCount || 0, cut: cut.cut, rounded: cut.rounded, cutInfo: cut,
+      start: startText, end: endText,
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true }));
+}
+
+// 锚点定位描述：节点名 + 沿线距离（用于打印模板保留定位尺寸）
+export function coverLocateText(design, cover, idx) {
+  const a = (cover.anchors || [])[idx];
+  if (!a) return '';
+  const w = wireById(design, a.wire);
+  if (!w) return `锚点${idx + 1}（导线缺失）`;
+  const pts = resolvePath(design, w);
+  const L = polyLen(pts);
+  const s = Math.max(0, Math.min(L, +a.s || 0));
+  const p = pointAtArc(pts, s);
+  const near = nearestNodeAt(design, p);
+  const tail = idx === 0 ? '起' : idx === (cover.anchors || []).length - 1 ? '止' : `#${idx + 1}`;
+  const base = near && dist(near, p) <= COVER_NEAR_NODE + 0.5
+    ? nodeName(design, near.id)
+    : `${w.label} 沿线 ${s.toFixed(0)}mm`;
+  return `${base}（${tail}）`;
+}
+
+// 包覆用料汇总：套管按规格×内径统计根长，胶带按宽度×节距统计总带长
+export function coverMaterialSummary(design) {
+  const tube = new Map(); // key 材料+内径 → {count,total}
+  const tape = new Map();
+  for (const c of design.covers || []) {
+    const geo = coverGeometry(design, c);
+    if (!geo.seg.length) continue;
+    const cut = coverCutInfo(design, c, geo);
+    if (c.kind === 'tape') {
+      const key = `${c.spec || '胶带'} ⌀${(geo.maxD || 0).toFixed(1)} 宽${c.tapeW} 节距${cut.pitch.toFixed(1)}`;
+      if (!tape.has(key)) tape.set(key, { kind: 'tape', name: '胶带缠绕', spec: c.spec || '胶带', width: c.tapeW, pitch: cut.pitch, count: 0, total: 0 });
+      const g = tape.get(key);
+      g.count++; g.total += cut.cut;
+    } else {
+      const key = `${coverKind(c.kind).name} ${c.spec || ''} ⌀${c.innerD}`;
+      if (!tube.has(key)) tube.set(key, { kind: c.kind, name: coverKind(c.kind).name, spec: c.spec || '', innerD: c.innerD, count: 0, total: 0 });
+      const g = tube.get(key);
+      g.count++; g.total += cut.rounded ?? Math.ceil(cut.cut);
+    }
+  }
+  return [...tube.values(), ...tape.values()];
 }
 
 export function defaultEnds() {
@@ -486,6 +871,132 @@ export function bundleDiameter(design, wireIds) {
   return (design.settings.packFactor || 1.2) * Math.sqrt(sum);
 }
 
+// ---------- 包覆校验 ----------
+
+// 两包覆折线在同一束段上重叠的长度（不同导线/错位时为 0，采样近似）
+function coverOverlap(ga, gb) {
+  if (!ga.seg.length || !gb.seg.length) return 0;
+  let over = 0;
+  const samplePts = [];
+  for (const s of ga.seg) {
+    const L = dist(s.a, s.b), n = Math.max(1, Math.ceil(L / 5));
+    for (let i = 0; i <= n; i++) {
+      samplePts.push({ x: s.a.x + (s.b.x - s.a.x) * i / n, y: s.a.y + (s.b.y - s.a.y) * i / n });
+    }
+  }
+  for (const p of samplePts) {
+    for (const s of gb.seg) {
+      if (pointSegDist(p, s.a, s.b) <= 2.5) { over += 5 / Math.max(1, samplePts.length / (ga.length + 1)); break; }
+    }
+  }
+  // 采样近似足以判定“是否重叠”；返回重叠长度估值（仅用于阈值）
+  const hits = samplePts.filter(p => gb.seg.some(s => pointSegDist(p, s.a, s.b) <= 2.5)).length;
+  return hits / Math.max(1, samplePts.length) * ga.length;
+}
+
+export function validateCovers(design) {
+  const issues = [];
+  const covers = design.covers || [];
+  const geos = new Map();
+  for (const c of covers) geos.set(c.id, coverGeometry(design, c));
+
+  for (const c of covers) {
+    const g = geos.get(c.id);
+    const tag = `包覆 ${c.name}（${coverKind(c.kind).name}）`;
+
+    // 锚点悬空 / 导线缺失 / 超出端点
+    for (const d of g.dangling) {
+      issues.push({ level: 'error', kind: 'cover-broken', cover: c.id,
+        msg: `${tag} 第${d.i + 1}个路径锚点失效：${d.reason}，请重新指定包覆起止` });
+    }
+    // 包覆跨越非连续束段
+    for (const b of g.broken) {
+      issues.push({ level: 'error', kind: 'cover-broken', cover: c.id,
+        msg: `${tag} 跨越非连续束段：第${b.i + 1}~${b.i + 2}个锚点${b.reason}（> ${COVER_MAX_JUMP}mm）` });
+    }
+    if (!c.anchors || c.anchors.length < 2) {
+      issues.push({ level: 'warn', kind: 'cover-broken', cover: c.id, msg: `${tag} 路径锚点不足 2 个` });
+    }
+
+    // 内径核算
+    if (c.kind !== 'tape') {
+      if (!(c.innerD > 0)) {
+        issues.push({ level: 'error', kind: 'cover-id', cover: c.id, msg: `${tag} 未设置内径（最大束径 ⌀${g.maxD.toFixed(1)}）` });
+      } else if (g.maxD > 0 && c.innerD < g.maxD - 1e-9) {
+        issues.push({ level: 'error', kind: 'cover-id', cover: c.id,
+          msg: `${tag} 内径不足：⌀${c.innerD} < 束径 ⌀${g.maxD.toFixed(1)}，套不进该束段` });
+      } else if (g.maxD > 0 && c.innerD < g.maxD + 1) {
+        issues.push({ level: 'warn', kind: 'cover-id', cover: c.id,
+          msg: `${tag} 内径裕量偏小：⌀${c.innerD} 对束径 ⌀${g.maxD.toFixed(1)} 不足 1mm` });
+      }
+    }
+
+    // 接头无法穿套：收口端若已有连接器/拼接件端头且外径大于内径，
+    // 整根套管无法从该端穿入 → 必须在相应压接之前裁套、预套
+    if (c.kind !== 'tape') {
+      for (const ep of [['起', g.startNode], ['止', g.endNode]]) {
+        const node = ep[1];
+        if (!node || (node.type !== 'connector' && node.type !== 'splice')) continue;
+        const dim = endPassDim(design, node);
+        if (dim > 0 && c.innerD > 0 && c.innerD < dim) {
+          issues.push({ level: 'error', kind: 'cover-pass', cover: c.id, node: node.id,
+            msg: `${tag} ${ep[0]}端收口位于 ${nodeName(design, node.id)}，已装端头外形 ⌀${dim} > 套管内径 ⌀${c.innerD}：无法穿套，装配时须把裁套与预套排在该端压接之前` });
+        }
+      }
+    }
+
+    // 收口压到连接器或拼接件（收口间隙不足）
+    for (const [ep, near, at] of [['起', g.startNodeNear, g.startNode], ['止', g.endNodeNear, g.endNode]]) {
+      if (!near || (near.type !== 'connector' && near.type !== 'splice')) continue;
+      const d = dist(g.pts[ep === '起' ? 0 : g.pts.length - 1], near);
+      if (at && d <= COVER_NEAR_NODE) {
+        issues.push({ level: 'warn', kind: 'cover-end', cover: c.id, node: near.id,
+          msg: `${tag} ${ep}端收口直抵 ${nodeName(design, near.id)}（间隙 0mm），建议留出 ≥${COVER_END_GAP}mm 收口距离，避免压到连接器/拼接件` });
+      }
+    }
+
+    // 分支露线：路径内部经过分叉点，收口方式为“不处理”
+    if (g.seg.length) {
+      for (const n of g.nodes) {
+        if (n.type === 'branch' && c.branchClose === 'none') {
+          issues.push({ level: 'error', kind: 'cover-branch', cover: c.id, node: n.id,
+            msg: `${tag} 经过分支 ${nodeName(design, n.id)} 但收口方式为“不处理”，分支处会露线` });
+        }
+      }
+    }
+  }
+
+  // 层次冲突：同层包覆在同一束段重叠 → 冲突；异层嵌套时外径需容得下
+  const ids = covers.map(c => c.id);
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const ca = covers.find(c => c.id === ids[i]), cb = covers.find(c => c.id === ids[j]);
+      const ga = geos.get(ca.id), gb = geos.get(cb.id);
+      if (!ga.ok || !gb.ok) continue;
+      const ov = coverOverlap(ga, gb);
+      if (ov < 5) continue; // 重叠 <5mm 忽略
+      if (ca.kind === 'tape' && cb.kind === 'tape') {
+        issues.push({ level: 'warn', kind: 'cover-layer', cover: ca.id,
+          msg: `包覆 ${ca.name} 与 ${cb.name} 在约 ${ov.toFixed(0)}mm 束段上重复缠带` });
+      } else if ((ca.layer || 1) === (cb.layer || 1)) {
+        issues.push({ level: 'error', kind: 'cover-layer', cover: ca.id,
+          msg: `层次冲突：${ca.name} 与 ${cb.name} 同为第 ${ca.layer} 层，却在约 ${ov.toFixed(0)}mm 束段上重叠` });
+      } else {
+        // 异层：外层内径需 > 内层外径 + 双侧壁厚
+        const [inner, outer] = (ca.layer || 1) < (cb.layer || 1) ? [ca, cb] : [cb, ca];
+        if (outer.kind !== 'tape' && inner.kind !== 'tape' && outer.innerD > 0) {
+          const innerOd = inner.innerD + 2 * coverKind(inner.kind).wall;
+          if (outer.innerD < innerOd + COVER_WALL_GAP) {
+            issues.push({ level: 'warn', kind: 'cover-layer', cover: outer.id,
+              msg: `包覆嵌套过紧：外层 ${outer.name} 内径 ⌀${outer.innerD} 小于内层 ${inner.name} 外径 ⌀${innerOd.toFixed(1)} + ${COVER_WALL_GAP}mm 间隙` });
+          }
+        }
+      }
+    }
+  }
+  return issues;
+}
+
 // ---------- 校验 ----------
 
 export function validate(design) {
@@ -788,6 +1299,9 @@ export function validate(design) {
     }
   }
 
+  // ---------- 包覆（波纹管 / 编织套管 / 胶带缠绕） ----------
+  issues.push(...validateCovers(design));
+
   const order = { error: 0, warn: 1, info: 2 };
   issues.sort((a, b) => order[a.level] - order[b.level]);
   return issues;
@@ -941,11 +1455,14 @@ export function assemblyOrder(design) {
   })).sort((a, b) => (b.shared - a.shared) || (b.length - a.length));
 }
 
-// 装配步骤：先逐根送线，再按拼接件引导集线/压接/套管。
-// 拼接步骤在其所属导线全部敷设之后；就绪度 = 已确认导线数 / 接入导线数。
-export function assemblySteps(design, confirmedWires) {
+// 装配步骤：先逐根送线，再按拼接件引导集线/压接/套管，最后按路线完成包覆。
+// 对无法穿过已装端头的套管（收口端连接器/拼接件外形 > 内径），把“裁套/预套”
+// 排到相应压接之前：precut/preslip 步骤锚定在被阻塞的送线步骤之前，收口/缠带
+// 确认仍在导线全部敷设之后。拼接步骤在其所属导线全部敷设之后。
+export function assemblySteps(design, confirmedWires, confirmedCoverSteps = null) {
   const order = assemblyOrder(design);
   const wireIdx = new Map(order.map((o, i) => [o.wireId, i]));
+  const N = order.length;
   // 导线步骤直接展开装配顺序字段（length/shared/locked），渲染层直接 toFixed
   const steps = order.map((o, i) => ({ ...o, kind: 'wire', sort: i }));
   for (const sp of design.nodes.filter(n => n.type === 'splice')) {
@@ -957,16 +1474,74 @@ export function assemblySteps(design, confirmedWires) {
     }
     const maxIdx = Math.max(-1, ...att.map(a => wireIdx.get(a.wire.id) ?? -1));
     const done = att.filter(a => confirmedWires.has(a.wire.id)).length;
+    // 阻塞该拼接件压接的“预套”：收口端位于该件且内径小于端头外形的套管
+    const preCovers = (design.covers || []).filter(c => {
+      if (c.kind === 'tape') return false;
+      const g = coverGeometry(design, c);
+      return (g.startNode && g.startNode.id === sp.id) || (g.endNode && g.endNode.id === sp.id);
+    }).filter(c => c.innerD > 0 && c.innerD < endPassDim(design, sp));
     steps.push({
       kind: 'splice', spliceId: sp.id,
       label: `${spliceKind(sp.kind).name} ${sp.name}`,
       splice: sp, attaches: att, count: att.length,
       doneWires: done, ready: att.length >= 2 && done === att.length,
+      preCovers,
       // 排在最后一根所属导线之后、下一根导线之前
       sort: maxIdx + 0.5,
     });
   }
+
+  // 包覆步骤（裁切 → 套装/预套 → 收口 → 缠带确认）
+  let coverSeq = 0;
+  for (const c of design.covers || []) {
+    const g = coverGeometry(design, c);
+    if (!g.pts.length) continue;
+    const cut = coverCutInfo(design, c, g);
+    const base = { kind: 'cover', coverId: c.id, cover: c, geo: g, cut };
+    const blockedNode = c.kind !== 'tape'
+      ? [g.startNode, g.endNode].find(n => n && (n.type === 'connector' || n.type === 'splice') &&
+          endPassDim(design, n) > 0 && c.innerD > 0 && c.innerD < endPassDim(design, n))
+      : null;
+    const throughWires = [...new Set(g.seg.flatMap(s => s.wires).filter(id => wireById(design, id)))];
+    const maxWireIdx = Math.max(-1, ...throughWires.map(id => wireIdx.get(id) ?? -1));
+    const layer = c.layer || 1;
+
+    if (c.kind === 'tape') {
+      steps.push({ ...base, phase: 'tape', phaseName: '缠带确认',
+        label: `${coverKind(c.kind).name} ${c.name} 缠带确认`,
+        sort: N + layer * 10 + coverSeq + 0.9 });
+    } else {
+      // 裁切（必要时带预套警示）
+      const cutLen = cut.rounded ?? Math.ceil(cut.cut);
+      steps.push({ ...base, phase: 'cut', phaseName: '裁切',
+        label: `${coverKind(c.kind).name} ${c.name} 裁切 ${cutLen}mm`,
+        blocked: !!blockedNode, gateNode: blockedNode ? blockedNode.id : null,
+        sort: blockedNode ? (wireIdx.get(g.startNode && design.wires.find(w => w.from.node === blockedNode.id || w.to.node === blockedNode.id)?.id) ?? maxWireIdx) - 0.4
+                         : N + layer * 10 + coverSeq + 0.1 });
+      if (blockedNode) {
+        // 预套：排到被阻塞端头的压接/送线之前
+        const gateWire = design.wires.find(w => w.from.node === blockedNode.id || w.to.node === blockedNode.id);
+        const gi = gateWire ? (wireIdx.get(gateWire.id) ?? maxWireIdx) : maxWireIdx;
+        steps.push({ ...base, phase: 'preslip', phaseName: '预套',
+          label: `${coverKind(c.kind).name} ${c.name} 预套（在 ${nodeName(design, blockedNode.id)} 压接之前）`,
+          gateNode: blockedNode.id, sort: gi - 0.2 });
+      } else {
+        steps.push({ ...base, phase: 'fit', phaseName: '套装',
+          label: `${coverKind(c.kind).name} ${c.name} 套装`,
+          sort: N + layer * 10 + coverSeq + 0.3 });
+      }
+      steps.push({ ...base, phase: 'close', phaseName: '收口',
+        label: `${coverKind(c.kind).name} ${c.name} 收口（${COVER_CLOSE.find(x => x.id === c.branchClose)?.name || c.branchClose}）`,
+        sort: N + layer * 10 + coverSeq + 0.6 });
+    }
+    coverSeq++;
+  }
   return steps.sort((a, b) => a.sort - b.sort);
+}
+
+// 包覆步骤的确认键（供装配推演逐项确认/撤回）
+export function coverStepKey(step) {
+  return `cover:${step.coverId}:${step.phase}`;
 }
 
 // ---------- 路径整理（跳过锁定） ----------
@@ -1068,5 +1643,34 @@ export function sampleDesign() {
     }
   }
   autoNets(d);
+  // 示例包覆：J1→N1→B1 六线主干套波纹管（不到连接器，两端各留收口距离）；
+  // B1→N3 两支缠胶带（半叠绕）。锚点存 (导线, 弧长)，改线后按路径重算。
+  const w101 = d.wires.find(w => w.label === 'W-101');
+  const w104 = d.wires.find(w => w.label === 'W-104');
+  // 在某导线上求路径经过 node 时的累计弧长，再加偏移（负=未到该节点 offset mm）
+  const arcAt = (wire, nodeId, offset) => {
+    const pts = resolvePath(d, wire);
+    const total = polyLen(pts);
+    let acc = 0, at = pts[0].node === nodeId ? 0 : total;
+    for (let i = 1; i < pts.length; i++) {
+      const L = dist(pts[i - 1], pts[i]);
+      if (pts[i].node === nodeId) { at = acc + L; break; }
+      acc += L;
+    }
+    return Math.max(0, Math.min(total, at + offset));
+  };
+  d.covers.push(makeCover(d, 'corr', [
+    { wire: w101.id, s: arcAt(w101, J1.id, 10) },
+    { wire: w101.id, s: arcAt(w101, B1.id, -10) },
+  ]));
+  d.covers[0].name = 'C1';
+  d.covers[0].spec = 'PA 阻燃波纹管';
+  d.covers[0].innerD = Math.max(d.covers[0].innerD, Math.ceil(coverGeometry(d, d.covers[0]).maxD + 2));
+  const tape = makeCover(d, 'tape', [
+    { wire: w104.id, s: arcAt(w104, B1.id, 6) },
+    { wire: w104.id, s: arcAt(w104, N3.id, -6) },
+  ]);
+  tape.name = 'C2'; tape.spec = 'PVC 电工胶带'; tape.overlap = 50; tape.pitch = 9.5; tape.tapeW = 19;
+  d.covers.push(tape);
   return d;
 }

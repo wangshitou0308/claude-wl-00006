@@ -21,6 +21,11 @@
     </span>
     <button data-tool="zone" class="tool" title="拖出禁布区 (Z)">禁布区</button>
     <button data-tool="wire" class="tool" title="布线：点连接器起点→途经点→连接器终点 (W)">布线</button>
+    <span class="tb-group splice-tools" style="gap:2px">
+      <button data-tool="cover" data-kind="corr" class="tool" title="沿束段布置波纹管 (C)">〰波纹管</button>
+      <button data-tool="cover" data-kind="braid" class="tool" title="沿束段布置编织套管">⫷编织管</button>
+      <button data-tool="cover" data-kind="tape" class="tool" title="沿束段缠胶带">🩹缠带</button>
+    </span>
   </span>
   <span class="tb-group">
     <button id="zoomOut" title="缩小">−</button>
@@ -36,6 +41,7 @@
     <label class="chk"><input type="checkbox" id="optSnap" checked> 吸附</label>
     <label class="chk"><input type="checkbox" id="optBundles" checked> 束段标注</label>
     <label class="chk"><input type="checkbox" id="optTies"> 绑扎点</label>
+    <label class="chk"><input type="checkbox" id="optCovers" checked> 包覆</label>
     <label class="chk"><input type="checkbox" id="optLabels" checked> 线号</label>
   </span>
   <span class="tb-group">
@@ -56,11 +62,13 @@
       <g id="layer-zone"></g>
       <g id="layer-bundle"></g>
       <g id="layer-wire"></g>
+      <g id="layer-cover"></g>
       <g id="layer-tie"></g>
       <g id="layer-node"></g>
       <g id="layer-overlay"></g>
     </svg>
     <div id="pinPicker" class="hidden"></div>
+    <div id="coverBar" class="hidden"></div>
     <div id="stepBar" class="hidden"></div>
   </div>
 
