@@ -4,6 +4,7 @@
 import {
   resolvePath, computeBundles, cutList, materialSummary, tieList,
   nodeName, endpointStr, polyLen, spliceList, spliceKind, migrateDesign,
+  coverList, coverGeometry, coverKind, coverLocateText,
 } from './model.js';
 import { esc } from './render.js';
 
@@ -146,6 +147,21 @@ function printContent(design) {
   for (const t of tieList(design)) {
     h += `<g stroke="#e67700" stroke-width="0.6"><line x1="${t.x - 2.5}" y1="${t.y - 2.5}" x2="${t.x + 2.5}" y2="${t.y + 2.5}"/><line x1="${t.x - 2.5}" y1="${t.y + 2.5}" x2="${t.x + 2.5}" y2="${t.y - 2.5}"/></g>`;
   }
+  // 包覆（波纹管/编织管/胶带）：按层次画出覆盖范围，标编号、起止与定位尺寸
+  for (const c of design.covers || []) {
+    const geo = coverGeometry(design, c);
+    if (!geo.pts.length) continue;
+    const kd = coverKind(c.kind);
+    const d = geo.pts.map((p, i) => (i ? 'L' : 'M') + p.x + ' ' + p.y).join(' ');
+    const w = c.kind === 'tape' ? Math.max(2.2, geo.maxD + 1.2) : Math.max(c.innerD || 2, geo.maxD + 1);
+    h += `<path d="${d}" fill="none" stroke="${kd.color}" stroke-width="${w}" stroke-opacity="0.35" stroke-linecap="round"/>`;
+    // 起止端竖线（收口位置）
+    for (const p of [geo.pts[0], geo.pts[geo.pts.length - 1]]) {
+      h += `<line x1="${p.x}" y1="${p.y - w / 2 - 1}" x2="${p.x}" y2="${p.y + w / 2 + 1}" stroke="${kd.color}" stroke-width="0.6"/>`;
+    }
+    const mid = geo.pts[Math.floor(geo.pts.length / 2)];
+    h += `<text x="${mid.x}" y="${mid.y + 1.5}" font-size="4.2" font-weight="bold" fill="${kd.color}" text-anchor="middle" style="paint-order:stroke;stroke:#fff;stroke-width:1.2">${esc(kd.glyph)}${esc(c.name)}</text>`;
+  }
   for (const n of design.nodes) {
     if (n.type === 'connector') {
       const w = Math.max(34, (n.pins || 4) * 7 + 12), hh = 18;
@@ -204,8 +220,52 @@ export function openPrintTemplate(design) {
   </svg>
 </div>`;
   });
-  openPrintWindow(design.name + ' - 打印模板', pages + spliceTablePage(design), 'A4 landscape');
+  openPrintWindow(design.name + ' - 打印模板', pages + spliceTablePage(design) + coverTablePage(design), 'A4 landscape');
   return tiles.length;
+}
+
+// 包覆下料与定位表（保留包覆范围、层次、材料规格与定位尺寸）
+function coverTablePage(design) {
+  const covers = coverList(design);
+  if (!covers.length) return '';
+  const rows = covers.map(cv => {
+    const src = design.covers.find(x => x.id === cv.id);
+    const closeName = ({ seal: '胶带收口', split: '剖开收口', none: '不处理（露线）' })[cv.branchClose] || cv.branchClose;
+    const param = cv.kind === 'tape'
+      ? `宽${cv.tapeW}mm · 节距${cv.pitch}mm · 搭接${cv.overlap}%`
+      : `内径 ⌀${cv.innerD} · 搭接${cv.overlap}mm`;
+    const cutText = cv.kind === 'tape' ? cv.cut.toFixed(0) + 'mm' : cv.rounded + 'mm';
+    // 逐锚点定位尺寸：节点名 或 导线#弧长
+    const locs = (src.anchors || []).map((a, i) => esc(coverLocateText(design, src, i))).join(' → ');
+    return `<tr>
+      <td><b>${esc(cv.name)}</b><br><span style="color:#666">第${cv.layer}层</span></td>
+      <td>${esc(cv.glyph)} ${esc(cv.kindName)}</td>
+      <td>${esc(cv.spec || '—')}<br><span style="color:#666">${esc(param)}</span></td>
+      <td>⌀${cv.maxD.toFixed(1)}</td>
+      <td>${cv.length.toFixed(0)}</td>
+      <td><b>${cutText}</b></td>
+      <td>${esc(closeName)}</td>
+      <td class="l">${esc(cv.start)} → ${esc(cv.end)}</td>
+      <td class="l">${locs}</td></tr>`;
+  }).join('');
+  return `<div class="page">
+  <svg width="${PAGE_W}mm" height="${PAGE_H}mm" viewBox="0 0 ${PAGE_W} ${PAGE_H}" xmlns="http://www.w3.org/2000/svg">
+    <foreignObject x="${MARGIN}" y="${MARGIN}" width="${PAGE_W - 2 * MARGIN}" height="${PAGE_H - 2 * MARGIN}">
+      <div xmlns="http://www.w3.org/1999/xhtml" style="font-family:sans-serif;color:#000">
+        <h3 style="margin:0 0 6px;font-size:15px">${esc(design.name)} — 包覆下料与定位表（波纹管 / 编织套管 / 胶带缠绕）</h3>
+        <table style="border-collapse:collapse;width:100%;font-size:10px" border="1">
+          <thead><tr style="background:#eee">
+            <th>编号/层次</th><th>类型</th><th>材料规格/参数</th><th>束径max</th>
+            <th>路径mm</th><th>下料/用带</th><th>分支收口</th>
+            <th style="text-align:left">起止范围</th><th style="text-align:left">逐锚点定位尺寸（沿路径锚点）</th>
+          </tr></thead><tbody>${rows}</tbody></table>
+        <p style="font-size:10px;color:#444;margin-top:8px">
+          定位尺寸以“节点名”或“导线 沿线路长mm”给出；套管内径须 ≥ 束径，穿不过已装端头时，
+          须在相应压接之前完成裁套与预套。钉板图中包覆按层次以彩色半透明覆盖段画出，起止竖线为收口位置。</p>
+      </div>
+    </foreignObject>
+  </svg>
+</div>`;
 }
 
 // 拼接件下料与工艺表（保留拼接拓扑：孔位、线径、剥线、保护套、接入线号）

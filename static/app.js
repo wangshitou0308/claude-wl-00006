@@ -1423,7 +1423,7 @@ function renderStepBar() {
       if (st.lock) w.locked = true;
       advance();
     };
-  } else {
+  } else if (s.kind === 'splice') {
     const sp = s.splice;
     const kd = M.spliceKind(sp.kind);
     // 实时重算就位情况（导线可能在本步骤之前刚确认）

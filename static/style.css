@@ -174,7 +174,20 @@ table.list tr.cur td { background: #bbdefb; }
   display: inline-block; min-width: 22px; text-align: center; font-size: 11px;
   background: #efebe9; border: 1px solid #8d6e63; border-radius: 3px; color: #5d4037;
 }
+.asmitem .covertag {
+  display: inline-block; min-width: 22px; text-align: center; font-size: 11px;
+  background: #fff; border: 1px solid #90a4ae; border-radius: 3px;
+}
 .asmitem .asmname { flex: 1; }
+
+/* 包覆绘制工具条 */
+#coverBar {
+  position: absolute; left: 50%; transform: translateX(-50%); top: 12px; z-index: 20;
+  background: #e8f5e9; border: 1px solid #2e7d32; border-radius: 8px;
+  box-shadow: 0 4px 16px #0003; padding: 6px 12px; display: flex; align-items: center; gap: 10px;
+  max-width: 92%;
+}
+#coverBar .prog { color: #1b5e20; font-weight: 700; }
 .netitem .prog { font-size: 11px; color: #37474f; display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
 .netitem button, .mini { font-size: 11px; padding: 1px 6px; }
 .recitem { padding: 5px 8px; border-radius: 5px; margin: 4px 0; background: #fff; border: 1px solid #cfd8dc; cursor: pointer; font-size: 12px; }
