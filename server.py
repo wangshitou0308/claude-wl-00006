@@ -5,6 +5,7 @@
 用法：python3 server.py [--port 8765]
   钉板推演台：  http://127.0.0.1:8765/
   电气检验批次：http://127.0.0.1:8765/inspect
+  首件尺寸检验：http://127.0.0.1:8765/fai
 """
 import argparse
 import json
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import qc
+import fai
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(ROOT, 'static')
@@ -83,6 +85,41 @@ def init_db():
         )
         con.execute('CREATE INDEX IF NOT EXISTS idx_readings_batch ON readings(batch_id)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_disp_batch ON dispositions(batch_id)')
+
+        # 首件尺寸检验批次：待准备 preparing → 测量中 measuring → 待复核 review → 已放行 released
+        con.execute(
+            'CREATE TABLE IF NOT EXISTS fai_batches ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            ' design_id INTEGER NOT NULL,'
+            ' name TEXT NOT NULL,'
+            " status TEXT NOT NULL DEFAULT 'preparing',"
+            ' snapshot TEXT NOT NULL,'
+            ' snap_hash TEXT,'
+            ' created_at TEXT NOT NULL,'
+            ' updated_at TEXT NOT NULL)'
+        )
+        con.execute(
+            'CREATE TABLE IF NOT EXISTS fai_measurements ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            ' batch_id INTEGER NOT NULL,'
+            ' item TEXT NOT NULL,'
+            ' value REAL NOT NULL,'
+            ' unit TEXT,'
+            ' value_raw TEXT,'
+            ' operator TEXT, note TEXT,'
+            ' withdrawn INTEGER NOT NULL DEFAULT 0,'
+            ' created_at TEXT NOT NULL)'
+        )
+        con.execute(
+            'CREATE TABLE IF NOT EXISTS fai_dispositions ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+            ' batch_id INTEGER NOT NULL,'
+            ' akey TEXT NOT NULL, kind TEXT,'
+            ' action TEXT NOT NULL, note TEXT, operator TEXT,'
+            ' created_at TEXT NOT NULL)'
+        )
+        con.execute('CREATE INDEX IF NOT EXISTS idx_faim_batch ON fai_measurements(batch_id)')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_faid_batch ON fai_dispositions(batch_id)')
 
 
 # ---------- 钉板方案存档 ----------
@@ -349,6 +386,278 @@ def db_disposition_add(bid, body):
     return {'ok': True}, None
 
 
+# ---------- 首件尺寸检验批次 ----------
+
+FAI_STATUS = ('preparing', 'measuring', 'review', 'released')
+
+
+def fai_list():
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            'SELECT b.id, b.name, b.status, b.created_at, b.updated_at, b.design_id, b.snap_hash,'
+            " COALESCE(d.name, '（方案已删除）'),"
+            ' (SELECT COUNT(*) FROM fai_measurements m WHERE m.batch_id = b.id AND m.withdrawn = 0)'
+            ' FROM fai_batches b LEFT JOIN designs d ON d.id = b.design_id'
+            ' ORDER BY b.updated_at DESC, b.id DESC'
+        ).fetchall()
+    out = []
+    for r in rows:
+        stale = False
+        try:
+            d = db_get(r[5])
+            if d:
+                stale = fai.current_hash(d['data']) != r[6]
+        except (ValueError, TypeError, KeyError):
+            stale = True
+        out.append({'id': r[0], 'name': r[1], 'status': r[2],
+                    'created_at': r[3], 'updated_at': r[4], 'design_id': r[5],
+                    'design_name': r[7], 'measurements': r[8], 'stale': stale})
+    return out
+
+
+def fai_get(bid):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            'SELECT id, name, status, snapshot, snap_hash, created_at, updated_at, design_id'
+            ' FROM fai_batches WHERE id=?', (bid,)).fetchone()
+    if not row:
+        return None
+    return {'id': row[0], 'name': row[1], 'status': row[2],
+            'snapshot': json.loads(row[3]), 'snap_hash': row[4] or '',
+            'created_at': row[5], 'updated_at': row[6], 'design_id': row[7]}
+
+
+def fai_measurements(bid):
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            'SELECT id, item, value, unit, value_raw, operator, note, withdrawn, created_at'
+            ' FROM fai_measurements WHERE batch_id=? ORDER BY id', (bid,)).fetchall()
+    return [{'id': r[0], 'item': r[1], 'value': r[2], 'unit': r[3] or '',
+             'value_raw': r[4] or '', 'operator': r[5] or '', 'note': r[6] or '',
+             'withdrawn': bool(r[7]), 'created_at': r[8]} for r in rows]
+
+
+def fai_dispositions(bid):
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            'SELECT id, akey, kind, action, note, operator, created_at'
+            ' FROM fai_dispositions WHERE batch_id=? ORDER BY id', (bid,)).fetchall()
+    return [{'id': r[0], 'akey': r[1], 'kind': r[2] or '', 'action': r[3],
+             'note': r[4] or '', 'operator': r[5] or '', 'created_at': r[6]} for r in rows]
+
+
+def fai_detail(bid):
+    b = fai_get(bid)
+    if not b:
+        return None
+    snap = b.pop('snapshot')
+    measurements = fai_measurements(bid)
+    disps = fai_dispositions(bid)
+    analysis = fai.analyze(snap, measurements, disps, released=(b['status'] == 'released'))
+    stale = False
+    d = db_get(b['design_id'])
+    try:
+        stale = bool(d) and fai.current_hash(d['data']) != b.get('snap_hash')
+    except (ValueError, TypeError, KeyError):
+        stale = True
+    return {'batch': b, 'snapshot': snap, 'measurements': measurements,
+            'dispositions': [_fai_disp_out(x) for x in disps],
+            'analysis': analysis, 'stale': stale}
+
+
+def _fai_disp_out(d):
+    x = dict(d)
+    x['action_name'] = fai.DISP_NAMES.get(d['action'], d['action'])
+    return x
+
+
+def fai_create(design_id, name, tolerances=None):
+    d = db_get(design_id)
+    if not d:
+        return None, '钉板方案不存在'
+    try:
+        snap = fai.build_snapshot(d['data'], design_id=d['id'], design_name=d['name'],
+                                  tol=tolerances)
+    except (ValueError, TypeError, KeyError) as e:
+        return None, '尺寸快照失败：%s' % e
+    now = now_iso()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            'INSERT INTO fai_batches(design_id, name, status, snapshot, snap_hash, created_at, updated_at)'
+            ' VALUES(?,?,?,?,?,?,?)',
+            (design_id, name, 'preparing', json.dumps(snap, ensure_ascii=False),
+             snap.get('hash'), now, now))
+        return cur.lastrowid, None
+
+
+def fai_save_snapshot(bid, snapshot):
+    """更新快照（仅待准备可改：追加自选测点/公差）并重算指纹。"""
+    snapshot['hash'] = fai.snapshot_hash(snapshot)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('UPDATE fai_batches SET snapshot=?, snap_hash=?, updated_at=? WHERE id=?',
+                    (json.dumps(snapshot, ensure_ascii=False), snapshot['hash'], now_iso(), bid))
+
+
+def fai_action(bid, action):
+    """状态机：开测/完成测量/返回测量/放行。放行要求必测项合格或完成授权处置。"""
+    b = fai_get(bid)
+    if not b:
+        return None, (404, '批次不存在')
+    st = b['status']
+    if st == 'released':
+        return None, (409, '已放行记录不可改写')
+    snap = b['snapshot']
+    an = fai.analyze(snap, fai_measurements(bid), fai_dispositions(bid))
+    if action == 'start':
+        if st != 'preparing':
+            return None, (409, '仅待准备批次可开测')
+        newst = 'measuring'
+    elif action == 'finish':
+        if st != 'measuring':
+            return None, (409, '仅测量中批次可完成测量')
+        newst = 'review'
+    elif action == 'reopen':
+        if st != 'review':
+            return None, (409, '仅待复核批次可返回测量')
+        newst = 'measuring'
+    elif action == 'release':
+        if st != 'review':
+            return None, (409, '仅待复核批次可放行')
+        if not an['stats']['releasable']:
+            return None, (409, '必测项未全部合格或完成授权处置，不能放行',
+                          [{'item': x.get('item'), 'reason': x['reason']} for x in an['blocking']])
+        newst = 'released'
+    else:
+        return None, (400, '未知操作：%s' % action)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('UPDATE fai_batches SET status=?, updated_at=? WHERE id=?',
+                    (newst, now_iso(), bid))
+    return {'ok': True, 'status': newst}, None
+
+
+def fai_delete(bid):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute('DELETE FROM fai_measurements WHERE batch_id=?', (bid,))
+        con.execute('DELETE FROM fai_dispositions WHERE batch_id=?', (bid,))
+        return con.execute('DELETE FROM fai_batches WHERE id=?', (bid,)).rowcount > 0
+
+
+def fai_add_measurement(bid, body):
+    b = fai_get(bid)
+    if not b:
+        return None, (404, '批次不存在')
+    if b['status'] != 'measuring':
+        return None, (409, '仅测量中批次可录入读数（支持中断续测）')
+    snap = b['snapshot']
+    iid = str(body.get('item') or '').strip()
+    it = next((x for x in snap['items'] if x['id'] == iid), None)
+    if not it:
+        return None, (400, '测点不存在：%s' % iid)
+    raw = body.get('value')
+    unit = str(body.get('unit') or '').strip()[:8]
+    v, unit_norm, err = fai.parse_value(raw, unit)
+    if err:
+        return None, (400, err)
+    operator = str(body.get('operator') or '').strip()[:50]
+    note = str(body.get('note') or '').strip()[:200]
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute(
+            'INSERT INTO fai_measurements(batch_id, item, value, unit, value_raw, operator, note,'
+            ' withdrawn, created_at) VALUES(?,?,?,?,?,?,?,0,?)',
+            (bid, iid, v, unit_norm, str(raw).strip()[:20], operator, note, now_iso()))
+        mid = cur.lastrowid
+        con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))
+    an = fai.analyze(snap, fai_measurements(bid), fai_dispositions(bid))
+    return {'ok': True, 'id': mid, 'analysis': an}, None
+
+
+def fai_withdraw(bid, mid=None):
+    """撤回读数：指定 ID 或撤回最近一条。仅测量中。"""
+    b = fai_get(bid)
+    if not b:
+        return None, (404, '批次不存在')
+    if b['status'] != 'measuring':
+        return None, (409, '仅测量中批次可撤回读数')
+    with sqlite3.connect(DB_PATH) as con:
+        if mid is None:
+            row = con.execute(
+                'SELECT id FROM fai_measurements WHERE batch_id=? AND withdrawn=0 ORDER BY id DESC LIMIT 1',
+                (bid,)).fetchone()
+            if not row:
+                return None, (404, '没有可撤回的读数')
+            mid = row[0]
+        cur = con.execute(
+            'UPDATE fai_measurements SET withdrawn=1 WHERE id=? AND batch_id=? AND withdrawn=0',
+            (mid, bid))
+        if not cur.rowcount:
+            return None, (404, '读数不存在或已撤回')
+        con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))
+    an = fai.analyze(b['snapshot'], fai_measurements(bid), fai_dispositions(bid))
+    return {'ok': True, 'id': mid, 'analysis': an}, None
+
+
+def fai_add_disposition(bid, body):
+    b = fai_get(bid)
+    if not b:
+        return None, (404, '批次不存在')
+    if b['status'] not in ('measuring', 'review'):
+        return None, (409, '当前状态不可登记处置；已放行记录不可改写')
+    akey = str(body.get('akey') or '').strip()[:200]
+    action = str(body.get('action') or '').strip()
+    if not akey:
+        return None, (400, '缺少异常标识')
+    if action not in fai.DISP_ACTIONS:
+        return None, (400, '处置结论无效（应为 rework/concession/scrap）')
+    kind = str(body.get('kind') or '').strip()[:30]
+    note = str(body.get('note') or '').strip()[:500]
+    operator = str(body.get('operator') or '').strip()[:50]
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            'INSERT INTO fai_dispositions(batch_id, akey, kind, action, note, operator, created_at)'
+            ' VALUES(?,?,?,?,?,?,?)', (bid, akey, kind, action, note, operator, now_iso()))
+        con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))
+    an = fai.analyze(b['snapshot'], fai_measurements(bid), fai_dispositions(bid))
+    return {'ok': True, 'analysis': an}, None
+
+
+def fai_add_item(bid, body):
+    """待准备阶段补录自选测点（点选两个基准）。"""
+    b = fai_get(bid)
+    if not b:
+        return None, (404, '批次不存在')
+    if b['status'] != 'preparing':
+        return None, (409, '自选测点仅可在待准备阶段加入，请开测前完成测点编排')
+    snap = b['snapshot']
+    try:
+        it = fai.custom_item(
+            snap, str(body.get('ref_a') or ''), str(body.get('ref_b') or ''),
+            name=str(body.get('name') or '').strip() or '',
+            tol_neg=float(body.get('tol_neg') if body.get('tol_neg') is not None else 5.0),
+            tol_pos=float(body.get('tol_pos') if body.get('tol_pos') is not None else 5.0))
+    except ValueError as e:
+        return None, (400, str(e))
+    snap['items'].append(it)
+    fai_save_snapshot(bid, snap)
+    return {'ok': True, 'item': it, 'hash': snap['hash']}, None
+
+
+def fai_compare(ids):
+    if len(ids) < 2:
+        return None, (400, '并排比较至少需要两个批次')
+    details = []
+    for i in ids:
+        d = fai_detail(i)
+        if not d:
+            return None, (404, '批次 %s 不存在' % i)
+        if d['batch']['status'] != 'released':
+            return None, (409, '批次「%s」尚未放行，不能参与比较' % d['batch']['name'])
+        details.append(d)
+    if len({d['batch']['design_id'] for d in details}) > 1:
+        return None, (409, '仅可按同一方案并排比较')
+    return {'batches': fai.compare_rows(details)['batches'],
+            'items': fai.compare_rows(details)['items']}, None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'HarnessBench/1.1'
     protocol_version = 'HTTP/1.1'
@@ -413,10 +722,14 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in path.split('/') if p]
         if parts[:2] == ['api', 'batches']:
             return self._batches_get(parts)
+        if parts[:2] == ['api', 'fai']:
+            return self._fai_get(parts)
         if path == '/' or path == '/index.html':
             return self._file(os.path.join(STATIC_DIR, 'index.html'))
         if path == '/inspect' or path == '/inspect.html':
             return self._file(os.path.join(STATIC_DIR, 'inspect.html'))
+        if path == '/fai' or path == '/fai.html':
+            return self._file(os.path.join(STATIC_DIR, 'fai.html'))
         if path.startswith('/static/'):
             rel = os.path.normpath(path[len('/static/'):]).lstrip(os.sep)
             full = os.path.join(STATIC_DIR, rel)
@@ -440,6 +753,23 @@ class Handler(BaseHTTPRequestHandler):
             if not d:
                 return self._error(404, '批次不存在')
             return self._json(qc.analyze(d['snapshot'], d['readings'], d['dispositions']))
+        self._error(404, '未找到')
+
+    def _fai_get(self, parts):
+        # /api/fai | /api/fai/{id} | /api/fai/compare?ids=..
+        if len(parts) == 2:
+            return self._json(fai_list())
+        if len(parts) == 3 and parts[2] == 'compare':
+            qs = parse_qs(urlparse(self.path).query)
+            ids = [int(x) for x in (qs.get('ids') or [''])[0].split(',') if x.strip().isdigit()]
+            res, err = fai_compare(ids)
+            if err:
+                payload = {'error': err[1]}
+                return self._json(payload, err[0])
+            return self._json(res)
+        if len(parts) == 3 and parts[2].isdigit():
+            d = fai_detail(int(parts[2]))
+            return self._json(d) if d else self._error(404, '批次不存在')
         self._error(404, '未找到')
 
     def _batches_compare(self, ids):
@@ -477,6 +807,62 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in path.split('/') if p]
         if parts[:2] == ['api', 'batches']:
             return self._batches_post(parts, body)
+        if parts[:2] == ['api', 'fai']:
+            return self._fai_post(parts, body)
+        self._error(404, '未找到')
+
+    def _fai_post(self, parts, body):
+        if len(parts) == 2:  # 新建首件批次（从已保存方案冻结尺寸快照）
+            try:
+                design_id = int(body.get('design_id'))
+            except (TypeError, ValueError):
+                return self._error(400, '缺少方案 ID')
+            name = str(body.get('name') or '').strip() or ('首件批次 ' + now_iso())
+            tolerances = body.get('tolerances') if isinstance(body.get('tolerances'), dict) else None
+            bid, err = fai_create(design_id, name, tolerances)
+            if err:
+                return self._error(400, err)
+            return self._json({'ok': True, 'id': bid})
+        if len(parts) < 3 or not parts[2].isdigit():
+            return self._error(404, '未找到')
+        bid = int(parts[2])
+        sub = parts[3] if len(parts) > 3 else ''
+
+        if sub == 'status':
+            res, err = fai_action(bid, str(body.get('action') or ''))
+            if err:
+                payload = {'error': err[1]}
+                if len(err) > 2:
+                    payload['blocking'] = err[2]
+                return self._json(payload, err[0])
+            return self._json(res)
+
+        if sub == 'measurements':
+            res, err = fai_add_measurement(bid, body)
+            if err:
+                return self._json({'error': err[1]}, err[0])
+            return self._json(res)
+
+        if sub == 'withdraw':
+            mid = body.get('id')
+            mid = int(mid) if isinstance(mid, int) or (isinstance(mid, str) and mid.isdigit()) else None
+            res, err = fai_withdraw(bid, mid)
+            if err:
+                return self._json({'error': err[1]}, err[0])
+            return self._json(res)
+
+        if sub == 'dispositions':
+            res, err = fai_add_disposition(bid, body)
+            if err:
+                return self._json({'error': err[1]}, err[0])
+            return self._json(res)
+
+        if sub == 'items':
+            res, err = fai_add_item(bid, body)
+            if err:
+                return self._json({'error': err[1]}, err[0])
+            return self._json(res)
+
         self._error(404, '未找到')
 
     def _batches_post(self, parts, body):
@@ -567,6 +953,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[:2] == ['api', 'batches'] and parts[2].isdigit():
             ok = db_batch_delete(int(parts[2]))
             return self._json({'ok': ok}) if ok else self._error(404, '批次不存在')
+        if len(parts) == 3 and parts[:2] == ['api', 'fai'] and parts[2].isdigit():
+            ok = fai_delete(int(parts[2]))
+            return self._json({'ok': ok}) if ok else self._error(404, '批次不存在')
         self._error(404, '未找到')
 
     def _file(self, full):
@@ -592,6 +981,7 @@ def main():
     print('存档数据库：%s' % DB_PATH)
     print('钉板推演台：  http://%s:%d/' % (args.host, args.port))
     print('电气检验批次：http://%s:%d/inspect' % (args.host, args.port))
+    print('首件尺寸检验：http://%s:%d/fai' % (args.host, args.port))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
