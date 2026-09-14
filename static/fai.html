@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>首件尺寸检验批次 — 线束钉板推演台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <span class="brand">📏 首件尺寸检验</span>
+  <span class="tb-group">
+    <select id="batchSel"></select>
+    <button id="newBatchBtn">新建批次</button>
+    <button id="delBatchBtn" title="删除未放行批次及其读数">删除</button>
+  </span>
+  <span id="batchStatus" class="qc-status"></span>
+  <span class="tb-group" id="statusActions"></span>
+  <span style="flex:1"></span>
+  <a class="navlink" href="/inspect" style="margin-right:12px">⚡ 电气检验</a>
+  <a class="navlink" href="/">← 返回钉板推演台</a>
+</header>
+
+<div id="qcMain">
+  <aside id="qcLeft">
+    <div id="batchMeta"></div>
+    <h4>检验路线测点</h4>
+    <div class="row">
+      <input id="routeFilter" type="text" placeholder="筛选测点/基准…" style="flex:1;min-width:120px">
+    </div>
+    <div id="routeList"></div>
+  </aside>
+
+  <section id="qcCenter">
+    <div id="staleBanner" class="hidden">⟳ 方案已变化：本批次测点来自冻结快照（不可改写），仅标记为快照过期；新尺寸请另建批次。</div>
+    <div id="releasedBanner" class="hidden">🔒 已放行记录受保护，只读不可改写。</div>
+    <div id="emptyHint" class="hidden">
+      <p>请选择左上角的首件批次，或点击「新建批次」从已保存的钉板方案冻结尺寸快照。</p>
+      <p class="hint">快照冻结连接器姿态、分支点、拼接件、包覆边界与理论尺寸；
+        流程：待准备 → 测量中 → 待复核 → 已放行。点选图上两个基准可补录自选测点或直接录入。</p>
+    </div>
+    <div id="boardWrap" class="fai-board-wrap hidden">
+      <div class="fai-board-toolbar">
+        <button id="zoomOut" title="缩小">−</button>
+        <span id="zoomLabel" class="zoom">100%</span>
+        <button id="zoomIn" title="放大">＋</button>
+        <button id="zoomFit" title="复位视图">复位</button>
+        <span id="pickHint" class="hint"></span>
+      </div>
+      <svg id="faiSvg" xmlns="http://www.w3.org/2000/svg">
+        <g id="view">
+          <g id="layer-board"></g>
+          <g id="layer-cover"></g>
+          <g id="layer-wire"></g>
+          <g id="layer-measure"></g>
+          <g id="layer-node"></g>
+        </g>
+      </svg>
+    </div>
+    <fieldset id="entryFields" class="hidden">
+      <legend>实测录入 <span id="entryHint" class="hint"></span></legend>
+      <div class="row">
+        <label>测点 <select id="entryItem"></select></label>
+        <span id="entryRefs" class="hint"></span>
+      </div>
+      <div class="row">
+        <label>理论值 <b id="entryNominal">—</b> mm　公差
+          <span id="entryTol">—</span></label>
+      </div>
+      <div class="row">
+        <label>实测值 <input id="entryValue" type="number" min="0" step="0.1" placeholder="数值"></label>
+        <label>单位
+          <select id="entryUnit">
+            <option value="mm" selected>mm</option>
+            <option value="cm">cm</option>
+            <option value="m">m</option>
+          </select>
+        </label>
+        <label>检验人 <input id="operator" type="text"></label>
+        <label>备注 <input id="note" type="text" placeholder="可空"></label>
+      </div>
+      <div class="row btns">
+        <button id="submitMeasure">录入读数</button>
+        <button id="pickMeasureBtn" title="在钉板图上点选两个基准后录入" disabled>点两基准录入</button>
+        <button id="withdrawLast" title="撤回最近一条有效读数（支持按测点）">撤回最近读数</button>
+        <button id="jumpNext">跳到下一测点</button>
+      </div>
+    </fieldset>
+  </section>
+
+  <aside id="qcRight">
+    <nav id="qcTabs">
+      <button data-tab="anoms" class="tab active">异常 <span id="anomBadge" class="badge hidden"></span></button>
+      <button data-tab="readings" class="tab">读数</button>
+      <button data-tab="compare" class="tab">比较</button>
+      <button data-tab="release" class="tab">放行</button>
+    </nav>
+    <section id="qcTab-anoms" class="qc-panel"></section>
+    <section id="qcTab-readings" class="qc-panel hidden"></section>
+    <section id="qcTab-compare" class="qc-panel hidden">
+      <h4>同方案批次比较（已放行）</h4>
+      <div id="cmpPick" class="row"></div>
+      <div id="cmpBox"></div>
+    </section>
+    <section id="qcTab-release" class="qc-panel hidden"></section>
+  </aside>
+</div>
+
+<footer id="statusbar">
+  <span id="statusHint">就绪</span>
+  <span id="statusPos"></span>
+</footer>
+
+<div id="newBatchModal" class="modal-mask hidden">
+  <div class="modal">
+    <h4>新建首件尺寸检验批次</h4>
+    <p class="hint">从已保存的钉板方案冻结连接器姿态、分支点、拼接件、包覆边界与理论尺寸；
+      此后方案再改不影响本批次，只标记快照过期。</p>
+    <div class="row"><label>钉板方案 <select id="nbDesign"></select></label></div>
+    <div class="row"><label>批次名称 <input id="nbName" type="text"></label></div>
+    <div class="row btns">
+      <button id="nbCreate">冻结并创建</button>
+      <button id="nbCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="pickModal" class="modal-mask hidden">
+  <div class="modal" style="width:440px">
+    <h4 id="pickTitle">点选两个基准</h4>
+    <p class="hint">在钉板图上依次点选两个基准（连接器/分支点/拼接件），系统量其直线理论尺寸。</p>
+    <div class="row"><label>名称 <input id="pickName" type="text" placeholder="自选测点名称（可空）"></label></div>
+    <div class="row">
+      <label>下偏差 <input id="pickNeg" type="number" value="5" min="0" step="0.5"> mm</label>
+      <label>上偏差 <input id="pickPos" type="number" value="5" min="0" step="0.5"> mm</label>
+    </div>
+    <div class="row" id="pickSel">基准 A：（未选）　｜　基准 B：（未选）</div>
+    <div class="row btns">
+      <button id="pickConfirm">确认</button>
+      <button id="pickMeasure">确认并去录入</button>
+      <button id="pickCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/static/fai.js"></script>
+</body>
+</html>

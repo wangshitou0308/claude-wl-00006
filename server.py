@@ -103,9 +103,9 @@ def init_db():
             ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
             ' batch_id INTEGER NOT NULL,'
             ' item TEXT NOT NULL,'
-            ' value REAL NOT NULL,'
+            ' value REAL,'                # 换算为 mm 的值；单位不明无法换算时为空
             ' unit TEXT,'
-            ' value_raw TEXT,'
+            ' value_raw TEXT,'            # 原始录入数值（不重复换算）
             ' operator TEXT, note TEXT,'
             ' withdrawn INTEGER NOT NULL DEFAULT 0,'
             ' created_at TEXT NOT NULL)'
@@ -116,10 +116,15 @@ def init_db():
             ' batch_id INTEGER NOT NULL,'
             ' akey TEXT NOT NULL, kind TEXT,'
             ' action TEXT NOT NULL, note TEXT, operator TEXT,'
+            ' meas_max_id INTEGER NOT NULL DEFAULT 0,'
             ' created_at TEXT NOT NULL)'
         )
         con.execute('CREATE INDEX IF NOT EXISTS idx_faim_batch ON fai_measurements(batch_id)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_faid_batch ON fai_dispositions(batch_id)')
+        # 兼容本会话早版结构：补处置时最大读数 ID（返工重测判定）
+        cols = [r[1] for r in con.execute('PRAGMA table_info(fai_dispositions)')]
+        if 'meas_max_id' not in cols:
+            con.execute('ALTER TABLE fai_dispositions ADD COLUMN meas_max_id INTEGER NOT NULL DEFAULT 0')
 
 
 # ---------- 钉板方案存档 ----------
@@ -427,23 +432,32 @@ def fai_get(bid):
             'created_at': row[5], 'updated_at': row[6], 'design_id': row[7]}
 
 
+def fai_max_measurement_id(con, bid):
+    row = con.execute(
+        'SELECT COALESCE(MAX(id),0) FROM fai_measurements WHERE batch_id=? AND withdrawn=0',
+        (bid,)).fetchone()
+    return row[0] or 0
+
+
 def fai_measurements(bid):
     with sqlite3.connect(DB_PATH) as con:
         rows = con.execute(
             'SELECT id, item, value, unit, value_raw, operator, note, withdrawn, created_at'
             ' FROM fai_measurements WHERE batch_id=? ORDER BY id', (bid,)).fetchall()
     return [{'id': r[0], 'item': r[1], 'value': r[2], 'unit': r[3] or '',
-             'value_raw': r[4] or '', 'operator': r[5] or '', 'note': r[6] or '',
+             'value_raw': r[4] if r[4] is not None else (str(r[2]) if r[2] is not None else ''),
+             'operator': r[5] or '', 'note': r[6] or '',
              'withdrawn': bool(r[7]), 'created_at': r[8]} for r in rows]
 
 
 def fai_dispositions(bid):
     with sqlite3.connect(DB_PATH) as con:
         rows = con.execute(
-            'SELECT id, akey, kind, action, note, operator, created_at'
+            'SELECT id, akey, kind, action, note, operator, meas_max_id, created_at'
             ' FROM fai_dispositions WHERE batch_id=? ORDER BY id', (bid,)).fetchall()
     return [{'id': r[0], 'akey': r[1], 'kind': r[2] or '', 'action': r[3],
-             'note': r[4] or '', 'operator': r[5] or '', 'created_at': r[6]} for r in rows]
+             'note': r[4] or '', 'operator': r[5] or '',
+             'meas_max_id': r[6] or 0, 'created_at': r[7]} for r in rows]
 
 
 def fai_detail(bid):
@@ -486,16 +500,18 @@ def fai_create(design_id, name, tolerances=None):
             'INSERT INTO fai_batches(design_id, name, status, snapshot, snap_hash, created_at, updated_at)'
             ' VALUES(?,?,?,?,?,?,?)',
             (design_id, name, 'preparing', json.dumps(snap, ensure_ascii=False),
-             snap.get('hash'), now, now))
+             snap.get('geom_hash'), now, now))
         return cur.lastrowid, None
 
 
 def fai_save_snapshot(bid, snapshot):
-    """更新快照（仅待准备可改：追加自选测点/公差）并重算指纹。"""
+    """更新快照（仅待准备可改：追加自选测点/公差）并重算指纹。
+    存储的 snap_hash 只含几何，故追加自选测点不会误报过期。"""
     snapshot['hash'] = fai.snapshot_hash(snapshot)
+    snapshot['geom_hash'] = fai.geometry_hash(snapshot)
     with sqlite3.connect(DB_PATH) as con:
         con.execute('UPDATE fai_batches SET snapshot=?, snap_hash=?, updated_at=? WHERE id=?',
-                    (json.dumps(snapshot, ensure_ascii=False), snapshot['hash'], now_iso(), bid))
+                    (json.dumps(snapshot, ensure_ascii=False), snapshot['geom_hash'], now_iso(), bid))
 
 
 def fai_action(bid, action):
@@ -536,10 +552,16 @@ def fai_action(bid, action):
 
 
 def fai_delete(bid):
+    b = fai_get(bid)
+    if not b:
+        return False
+    if b['status'] == 'released':
+        raise PermissionError('已放行批次受保护，不可删除')
     with sqlite3.connect(DB_PATH) as con:
         con.execute('DELETE FROM fai_measurements WHERE batch_id=?', (bid,))
         con.execute('DELETE FROM fai_dispositions WHERE batch_id=?', (bid,))
-        return con.execute('DELETE FROM fai_batches WHERE id=?', (bid,)).rowcount > 0
+        con.execute('DELETE FROM fai_batches WHERE id=?', (bid,))
+    return True
 
 
 def fai_add_measurement(bid, body):
@@ -555,20 +577,26 @@ def fai_add_measurement(bid, body):
         return None, (400, '测点不存在：%s' % iid)
     raw = body.get('value')
     unit = str(body.get('unit') or '').strip()[:8]
-    v, unit_norm, err = fai.parse_value(raw, unit)
-    if err:
-        return None, (400, err)
+    # 只做一次“原值→mm”换算；非数字拒绝，单位缺失/不明仍存档由分析层标记
+    parsed = fai.parse_value(raw, unit)
+    if parsed['error'] == 'bad_value':
+        return None, (400, '实测值必须是数字')
     operator = str(body.get('operator') or '').strip()[:50]
     note = str(body.get('note') or '').strip()[:200]
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute(
             'INSERT INTO fai_measurements(batch_id, item, value, unit, value_raw, operator, note,'
             ' withdrawn, created_at) VALUES(?,?,?,?,?,?,?,0,?)',
-            (bid, iid, v, unit_norm, str(raw).strip()[:20], operator, note, now_iso()))
+            (bid, iid, parsed['value_mm'], parsed['unit'], parsed['raw'],
+             operator, note, now_iso()))
         mid = cur.lastrowid
         con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))
     an = fai.analyze(snap, fai_measurements(bid), fai_dispositions(bid))
-    return {'ok': True, 'id': mid, 'analysis': an}, None
+    return {'ok': True, 'id': mid,
+            'warning': ('单位缺失（按 mm 计）' if parsed['error'] == 'missing_unit'
+                        else '单位不明：%s（读数待人工处理）' % parsed['unit']
+                        if parsed['error'] == 'unknown_unit' else None),
+            'analysis': an}, None
 
 
 def fai_withdraw(bid, mid=None):
@@ -608,13 +636,19 @@ def fai_add_disposition(bid, body):
         return None, (400, '缺少异常标识')
     if action not in fai.DISP_ACTIONS:
         return None, (400, '处置结论无效（应为 rework/concession/scrap）')
+    # 处置按测点生效：从 akey 解析测点，必须存在于冻结快照
+    iid = fai._item_of_key(akey)
+    if not iid or not any(x['id'] == iid for x in b['snapshot']['items']):
+        return None, (400, '异常标识对应的测点不存在')
     kind = str(body.get('kind') or '').strip()[:30]
     note = str(body.get('note') or '').strip()[:500]
     operator = str(body.get('operator') or '').strip()[:50]
     with sqlite3.connect(DB_PATH) as con:
+        meas_max = fai_max_measurement_id(con, bid)
         con.execute(
-            'INSERT INTO fai_dispositions(batch_id, akey, kind, action, note, operator, created_at)'
-            ' VALUES(?,?,?,?,?,?,?)', (bid, akey, kind, action, note, operator, now_iso()))
+            'INSERT INTO fai_dispositions(batch_id, akey, kind, action, note, operator,'
+            ' meas_max_id, created_at) VALUES(?,?,?,?,?,?,?,?)',
+            (bid, akey, kind, action, note, operator, meas_max, now_iso()))
         con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))
     an = fai.analyze(b['snapshot'], fai_measurements(bid), fai_dispositions(bid))
     return {'ok': True, 'analysis': an}, None
@@ -954,7 +988,10 @@ class Handler(BaseHTTPRequestHandler):
             ok = db_batch_delete(int(parts[2]))
             return self._json({'ok': ok}) if ok else self._error(404, '批次不存在')
         if len(parts) == 3 and parts[:2] == ['api', 'fai'] and parts[2].isdigit():
-            ok = fai_delete(int(parts[2]))
+            try:
+                ok = fai_delete(int(parts[2]))
+            except PermissionError as e:
+                return self._error(409, str(e))
             return self._json({'ok': ok}) if ok else self._error(404, '批次不存在')
         self._error(404, '未找到')
 

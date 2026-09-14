@@ -36,15 +36,13 @@ DEFAULT_TOL = {
     CUSTOM: {'neg': 5.0, 'pos': 5.0},
 }
 
-# 长度单位（全部换算为 mm）
+# 长度单位（全部换算为 mm）。空单位按 mm 计但提示“单位缺失”，
+# 无法识别的单位标“单位不明”，不做猜测换算。
 UNIT_TO_MM = {
     'mm': 1.0, '毫米': 1.0, 'm': 1000.0, '米': 1000.0,
     'cm': 10.0, '厘米': 10.0,
 }
-UNIT_ALIASES = {
-    '': 1.0,        # 空：默认 mm（不标“单位不明”）
-    'm/m': 1.0,
-}
+UNIT_CANON = {'毫米': 'mm', '米': 'm', '厘米': 'cm'}
 
 NEAR_NODE = 2.0   # 基准/边界吸附节点的距离阈值（mm）
 
@@ -99,6 +97,29 @@ def _nearest_node(design, p, skip=()):
 
 def _nat_key(name):
     return [(0, int(x)) if x.isdigit() else (1, x) for x in re.split(r'(\d+)', str(name))]
+
+
+def _base_node(n):
+    return bool(n) and n.get('type') in ('connector', 'branch', 'splice')
+
+
+def _wire_end_nodes(w, pts, by_id):
+    """导线两端的基准节点：以实际路径端点绑定的节点为准（冻结理论几何），
+    路径端点未绑定节点时才回退到保存的 from/to；返回 (node_a, node_b)。"""
+    out = []
+    path_ends = [pts[0] if pts else None, pts[-1] if pts else None]
+    saved = [(w.get('from') or {}).get('node'), (w.get('to') or {}).get('node')]
+    for i in range(2):
+        n = None
+        pe = path_ends[i]
+        if pe and pe.get('node') and _base_node(by_id.get(pe['node'])):
+            n = by_id[pe['node']]
+        else:
+            cand = by_id.get(saved[i])
+            if _base_node(cand):
+                n = cand
+        out.append(n)
+    return out[0], out[1]
 
 
 # ---------- 快照 ----------
@@ -162,44 +183,35 @@ def build_snapshot(design, design_id=None, design_name=None, tol=None):
             add(CONN_SPACING, '%s—%s 间距' % (a['name'], b['name']),
                 _ref_of_node(a), _ref_of_node(b), _dist(a, b))
 
-    # 2) 分支定位：每个分支点沿各引出支路到最近的连接器/分支/拼接
-    #    取该支路导线上从分支点起算的路径长（沿真实折线，而非直线）。
-    def path_from_node(wire, nid):
-        pts = wpaths.get(wire.get('id')) or []
+    # 2) 分支定位：每个分支点沿各引出支路到相邻连接器/分支/拼接的沿线路径长。
+    #    路径以“实际路径绑定节点”为准，避免保存端点与路径不一致时基准错位。
+    def path_from_node(pts, nid):
         idx = next((k for k, p in enumerate(pts) if p.get('node') == nid), None)
         if idx is None:
-            return None, 0.0
-        # 向两侧取到第一个“基准节点”（连接器/分支/拼接）的路径
+            return []
         results = []
         for step in (-1, 1):
             k = idx
             while 0 <= k + step < len(pts):
                 k += step
                 p = pts[k]
-                if p.get('node') and p['node'] != nid and p['node'] in by_id:
-                    t = by_id[p['node']]
-                    if t.get('type') in ('connector', 'branch', 'splice'):
-                        lo, hi = sorted((idx, k))
-                        results.append((t, _poly_len(pts[lo:hi + 1])))
-                        break
+                t = by_id.get(p.get('node'))
+                if t and p.get('node') != nid and _base_node(t):
+                    lo, hi = sorted((idx, k))
+                    results.append((t, _poly_len(pts[lo:hi + 1])))
+                    break
         return results
 
     for br in sorted(branches, key=lambda n: _nat_key(n.get('name'))):
         touched = []
         for w in wires:
-            ends = [w.get('from') or {}, w.get('to') or {}]
-            linked = any(e.get('node') == br.get('id') for e in ends)
             pts = wpaths.get(w.get('id')) or []
-            on_path = any(p.get('node') == br.get('id') for p in pts)
-            if not (linked or on_path):
+            if not any(p.get('node') == br.get('id') for p in pts):
                 continue
-            targets = path_from_node(w, br.get('id'))
-            for t, L in targets or []:
-                key = t.get('id')
-                if any(x[0] == key for x in touched) or L <= 1e-6:
+            for t, L in path_from_node(pts, br.get('id')):
+                if any(x[0] == t.get('id') for x in touched) or L <= 1e-6:
                     continue
-                touched.append((key, L, w.get('id')))
-        # 只保留最近的两条支路，避免大量组合；至少保留几何上存在的全部短支路
+                touched.append((t.get('id'), L, w.get('id')))
         touched.sort(key=lambda x: x[1])
         for key, L, wid in touched[:4]:
             t = by_id[key]
@@ -207,11 +219,10 @@ def build_snapshot(design, design_id=None, design_name=None, tol=None):
                 _ref_of_node(br), _ref_of_node(t), L,
                 wire=wid, note='沿支路线长')
 
-    # 3) 支路长度：每根两端均接到基准节点的导线，测路径折线长
+    # 3) 支路长度：两端基准节点以路径端点为准（保存端点与路径不一致时不产生错位）
     for w in sorted(wires, key=lambda x: str(x.get('label') or x.get('id'))):
         pts = wpaths.get(w.get('id')) or []
-        ep_a = by_id.get((w.get('from') or {}).get('node'))
-        ep_b = by_id.get((w.get('to') or {}).get('node'))
+        ep_a, ep_b = _wire_end_nodes(w, pts, by_id)
         if not ep_a or not ep_b or len(pts) < 2:
             continue
         L = _poly_len(pts)
@@ -256,16 +267,24 @@ def build_snapshot(design, design_id=None, design_name=None, tol=None):
                                         tnode['name'] if tnode else '（无基准）'),
                     required=bool(tnode))
 
-    # 5) 尾部余量：每根接到连接器的导线，连接器本体到首个折点（第二个路径顶点）
+    # 5) 尾部余量：连接器到引出后“首个自由折点”的直线段。
+    #    若相邻路径顶点仍绑定节点（导线直通分支/拼接/另一连接器），说明该端无
+    #    独立尾部，不生成测点（避免给直通导线造出不存在的尾部余量）。
     for w in sorted(wires, key=lambda x: str(x.get('label') or x.get('id'))):
         pts = wpaths.get(w.get('id')) or []
-        for side, ep in (('from', w.get('from') or {}), ('to', w.get('to') or {})):
+        if len(pts) < 2:
+            continue
+        for side, end_idx, nxt_idx in (('from', 0, 1), ('to', len(pts) - 1, len(pts) - 2)):
+            ep = pts[end_idx]
             n = by_id.get(ep.get('node'))
-            if not n or n.get('type') != 'connector' or len(pts) < 2:
+            if not n or n.get('type') != 'connector':
                 continue
-            idx = 0 if side == 'from' else len(pts) - 1
-            nxt = pts[1] if side == 'from' else pts[-2]
-            L = _dist(pts[idx], nxt)
+            nxt = pts[nxt_idx]
+            if nxt.get('node'):
+                continue  # 直通：相邻顶点是另一基准节点，无独立尾部
+            L = _dist(ep, nxt)
+            if L <= 1e-6:
+                continue
             add(TAIL, '%s %s端 %s 尾部余量' % (w.get('label') or w.get('id'),
                                                '起' if side == 'from' else '终', n['name']),
                 _ref_of_node(n),
@@ -294,14 +313,32 @@ def build_snapshot(design, design_id=None, design_name=None, tol=None):
             'strip': s.get('strip', 7),
             'sleeve_d': s.get('sleeveD', 0), 'sleeve_len': s.get('sleeveLen', 0),
         } for s in splices],
-        'wires': [_wire_freeze(w, wpaths.get(w.get('id')) or []) for w in wires
+        'wires': [_wire_freeze(w, wpaths.get(w.get('id')) or [], by_id) for w in wires
                   if wpaths.get(w.get('id'))],
         'covers': _covers_freeze(design, wpaths, wires, by_id),
         'items': items,
         'defaults': DEFAULT_TOL,
     }
     snapshot['hash'] = snapshot_hash(snapshot)
+    snapshot['geom_hash'] = geometry_hash(snapshot)
     return snapshot
+
+
+def geometry_hash(snapshot):
+    """只对冻结的几何（连接器/分支/拼接/导线路径/包覆边界）取指纹。
+    自选测点与公差调整不影响几何，因此不会误报快照过期。"""
+    payload = {
+        'connectors': [[c['id'], round(c['x'], 2), round(c['y'], 2)] for c in snapshot['connectors']],
+        'branches': [[b['id'], round(b['x'], 2), round(b['y'], 2)] for b in snapshot['branches']],
+        'splices': [[s['id'], round(s['x'], 2), round(s['y'], 2)] for s in snapshot['splices']],
+        'wires': [[w['id'], w['from_node'], w['to_node'],
+                   [[round(p['x'], 1), round(p['y'], 1)] for p in w['path']]]
+                  for w in snapshot['wires']],
+        'covers': [[c['id'], [[round(p['x'], 1), round(p['y'], 1)] for p in c['anchors']]]
+                   for c in snapshot['covers']],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
 
 
 def _cover_edge_target(pts, s, by_id, wire_id, wires):
@@ -321,12 +358,13 @@ def _cover_edge_target(pts, s, by_id, wire_id, wires):
     return best if best else (None, 0.0)
 
 
-def _wire_freeze(w, pts):
+def _wire_freeze(w, pts, by_id):
+    ep_a, ep_b = _wire_end_nodes(w, pts, by_id)
     return {
         'id': w.get('id'), 'label': str(w.get('label') or w.get('id')),
         'gauge': w.get('gauge', 0), 'color': w.get('color', '#888'),
-        'from_node': (w.get('from') or {}).get('node'),
-        'to_node': (w.get('to') or {}).get('node'),
+        'from_node': ep_a.get('id') if ep_a else None,
+        'to_node': ep_b.get('id') if ep_b else None,
         'path': [{'x': p['x'], 'y': p['y'], 'node': p.get('node')} for p in pts],
         'length': round(_poly_len(pts), 2),
     }
@@ -359,18 +397,12 @@ def _covers_freeze(design, wpaths, wires, by_id):
 
 
 def snapshot_hash(snapshot):
-    """对冻结的几何与测点做指纹；方案重新保存后据此判定快照是否过期。"""
+    """对冻结的几何与测点做指纹（快照内容版本，含测点编排）。"""
     payload = {
-        'connectors': [[c['id'], round(c['x'], 2), round(c['y'], 2)] for c in snapshot['connectors']],
-        'branches': [[b['id'], round(b['x'], 2), round(b['y'], 2)] for b in snapshot['branches']],
-        'splices': [[s['id'], round(s['x'], 2), round(s['y'], 2)] for s in snapshot['splices']],
-        'wires': [[w['id'], w['from_node'], w['to_node'],
-                   [[round(p['x'], 1), round(p['y'], 1)] for p in w['path']]]
-                  for w in snapshot['wires']],
-        'covers': [[c['id'], [[round(p['x'], 1), round(p['y'], 1)] for p in c['anchors']]]
-                   for c in snapshot['covers']],
+        'geom': geometry_hash(snapshot),
         'items': [[i['id'], i['kind'], i['nominal'],
-                   [r for r in i['axis_refs']], i['tol_neg'], i['tol_pos']]
+                   [r for r in i['axis_refs']], i['tol_neg'], i['tol_pos'],
+                   i.get('required', True)]
                   for i in snapshot['items']],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
@@ -378,189 +410,192 @@ def snapshot_hash(snapshot):
 
 
 def current_hash(design):
-    """对当前方案即时建快照取指纹（不落库），用于标记快照过期。"""
-    snap = build_snapshot(design)
-    return snap['hash']
+    """对当前方案即时建快照取几何指纹（不落库），用于标记快照过期。"""
+    return build_snapshot(design)['geom_hash']
 
 
 # ---------- 读数解析 ----------
 
 def parse_value(raw, unit):
-    """解析实测长度为 (mm 值, 单位文本, 错误)。
-    空单位默认 mm；无法识别的单位返回错误（标“单位不明”）。"""
+    """解析实测长度。返回 dict(value_mm, raw, unit, error)。
+
+    - 数字始终按“所填单位”换算一次到 mm（避免与存储值重复换算）；
+    - 空单位：按 mm 参与判定，但标记 missing_unit（提示补单位）；
+    - 无法识别的单位：unknown_unit，不猜测换算，读数转人工、不参与偏差判定。
+    """
+    s = str(raw if raw is not None else '').strip()
     try:
-        v = float(str(raw).strip())
-    except (TypeError, ValueError, AttributeError):
-        return None, '', '实测值必须是数字'
+        v = float(s)
+    except (TypeError, ValueError):
+        return {'value_mm': None, 'raw': s, 'unit': str(unit or ''),
+                'error': 'bad_value'}
     if not math.isfinite(v) or v < 0 or v > 1e6:
-        return None, '', '实测值超出范围'
-    u = str(unit or '').strip().lower()
-    scale = UNIT_TO_MM.get(u)
+        return {'value_mm': None, 'raw': s, 'unit': str(unit or ''),
+                'error': 'bad_value'}
+    u_raw = str(unit or '').strip()
+    u_key = u_raw.lower()
+    if u_key == '':
+        return {'value_mm': v, 'raw': s, 'unit': 'mm', 'error': 'missing_unit'}
+    scale = UNIT_TO_MM.get(u_key)
+    canon = UNIT_CANON.get(u_key, u_key)
     if scale is None:
-        scale = UNIT_ALIASES.get(u)
-    if scale is None:
-        return None, str(unit or ''), '单位不明：%s' % (unit or '（空）')
-    return v * scale, (u or 'mm'), None
+        return {'value_mm': None, 'raw': s, 'unit': u_raw,
+                'error': 'unknown_unit'}
+    return {'value_mm': v * scale, 'raw': s, 'unit': canon, 'error': None}
 
 
 # ---------- 分析 ----------
 
 def analyze(snapshot, readings, dispositions=None, released=False):
-    """对未撤回读数逐测点分析偏差与路线顺序，返回异常、测点状态与统计。
+    """对未撤回读数逐测点分析偏差与路线顺序。
 
-    异常 level：error（超差/基准缺失/结论矛盾）、manual（单位不明/测点错序/无效值）、
-    warn（重复测量）。返工处置后须重新测量；让步/报废可结案。
-    放行条件：必测项合格或均有授权处置（且无未决返工）。"""
+    异常 level：error（基准缺失/超差/结论矛盾/返工待重测）、
+    manual（单位缺失/单位不明/无效值/测点错序）、warn（重复测量）。
+    返工后必须新增合格读数；让步/报废可结案。放行条件：必测项合格或均完成
+    授权处置，且无未决返工。"""
     items = snapshot.get('items') or []
-    item_by_id = {it['id']: it for it in items}
     active = [r for r in (readings or []) if not r.get('withdrawn')]
     anomalies = []
 
-    def add(kind, key, level, msg, item=None, reading_id=None):
-        anomalies.append({
-            'kind': kind, 'key': key, 'level': level, 'msg': msg,
-            'item': item, 'reading_id': reading_id,
-        })
+    def add(kind, key, level, msg, item=None, reading_id=None, gating=False):
+        anomalies.append({'kind': kind, 'key': key, 'level': level, 'msg': msg,
+                          'item': item, 'reading_id': reading_id, 'gating': gating})
 
-    # 1) 基准缺失：测点在快照生成时就缺少被测基准（不可测）
+    # 1) 基准缺失（快照生成时就不可测的必测项）
     for it in items:
-        if it.get('required') and not _item_axis_ok(it):
+        if it.get('required', True) and not _item_axis_ok(it):
             add('missing_ref', 'missing:%s' % it['id'], 'error',
-                '基准缺失：%s（%s）缺少测量基准，无法测量' % (it['id'], it['name']), it['id'])
+                '基准缺失：%s（%s）缺少测量基准，无法测量' % (it['id'], it['name']),
+                it['id'], gating=True)
 
-    # 2) 逐测点聚合并判定最新有效读数
     by_item = {}
     for r in active:
         by_item.setdefault(r.get('item'), []).append(r)
 
     item_states = {}
-    order_cursor = 0          # 已按路线顺序测到的最大序号
-    measured_seq = []
+    measured_seq = []   # (seq, reading_id) 按读数时间
     for it in items:
         iid = it['id']
         rs = by_item.get(iid, [])
-        state = {
+        st = {
             'item': iid, 'kind': it['kind'], 'name': it['name'], 'seq': it['seq'],
             'required': it.get('required', True),
             'nominal': it['nominal'], 'tol_neg': it['tol_neg'], 'tol_pos': it['tol_pos'],
-            'status': 'pending',      # pending / ok / ng / bad
-            'latest': None, 'count': len(rs),
-            'dev': None, 'value_mm': None,
+            'status': 'pending', 'latest': None, 'count': len(rs),
+            'dev': None, 'value_mm': None, 'unit': '',
         }
         if rs:
             latest = max(rs, key=lambda x: x.get('id') or 0)
             measured_seq.append((it['seq'], latest.get('id') or 0))
-            v, unit, verr = parse_value(latest.get('value'), latest.get('unit'))
-            state['latest'] = latest
-            state['unit'] = unit
-            if verr:
-                state['status'] = 'bad'
+            parsed = parse_value(latest.get('value_raw', latest.get('value')),
+                                 latest.get('unit'))
+            st['latest'] = latest
+            st['unit'] = parsed['unit']
+            err = parsed['error']
+            if err == 'bad_value':
+                st['status'] = 'bad'
                 add('bad_value', 'badvalue:%s:%s' % (iid, latest.get('id')), 'manual',
-                    '%s：%s' % (it['name'], verr), iid, latest.get('id'))
+                    '无效值：%s 实测值“%s”不是有效数字' % (it['name'], parsed['raw']),
+                    iid, latest.get('id'), gating=True)
+            elif err == 'unknown_unit':
+                st['status'] = 'bad'
+                add('unknown_unit', 'unit:%s:%s' % (iid, latest.get('id')), 'manual',
+                    '单位不明：%s 实测 %s 的单位“%s”无法识别（支持 mm/cm/m）'
+                    % (it['name'], parsed['raw'], parsed['unit']),
+                    iid, latest.get('id'), gating=True)
             else:
-                dev = v - it['nominal']
-                state['value_mm'] = round(v, 3)
-                state['dev'] = round(dev, 3)
-                if -it['tol_neg'] - 1e-9 <= dev <= it['tol_pos'] + 1e-9:
-                    state['status'] = 'ok'
-                else:
-                    state['status'] = 'ng'
+                v = parsed['value_mm']
+                st['value_mm'] = round(v, 3)
+                st['dev'] = round(v - it['nominal'], 3)
+                if err == 'missing_unit':
+                    add('missing_unit', 'nounit:%s:%s' % (iid, latest.get('id')), 'manual',
+                        '单位缺失：%s 实测 %s 未标注单位（已按 mm 计，请补注）'
+                        % (it['name'], parsed['raw']), iid, latest.get('id'))
+                within = -it['tol_neg'] - 1e-9 <= (v - it['nominal']) <= it['tol_pos'] + 1e-9
+                st['status'] = 'ok' if within else 'ng'
+                if not within:
                     add('out_of_tol', 'ng:%s' % iid, 'error',
                         '超差：%s 理论 %.1f 实测 %.1f 偏差 %+.1f mm（公差 %+.1f/%+.1f）'
-                        % (it['name'], it['nominal'], v, dev, -it['tol_neg'], it['tol_pos']),
-                        iid, latest.get('id'))
-            # 结论矛盾：同测点多次有效读数跨“合格/超差”结论
-            valid = []
+                        % (it['name'], it['nominal'], v, v - it['nominal'],
+                           -it['tol_neg'], it['tol_pos']),
+                        iid, latest.get('id'), gating=True)
+            # 结论矛盾：同测点多次“可判定”读数跨合格/超差
+            verdicts = []
             for x in rs:
-                vv, _, e2 = parse_value(x.get('value'), x.get('unit'))
-                if e2 is None:
-                    ok = -it['tol_neg'] - 1e-9 <= (vv - it['nominal']) <= it['tol_pos'] + 1e-9
-                    valid.append(ok)
-            if len(set(valid)) > 1:
+                p2 = parse_value(x.get('value_raw', x.get('value')), x.get('unit'))
+                if p2['error'] in (None, 'missing_unit'):
+                    verdicts.append(-it['tol_neg'] - 1e-9
+                                    <= (p2['value_mm'] - it['nominal']) <= it['tol_pos'] + 1e-9)
+            if len(set(verdicts)) > 1:
                 add('conflict', 'conflict:%s' % iid, 'error',
-                    '结论矛盾：%s 共 %d 次测量，合格/超差结论不一致' % (it['name'], len(rs)), iid)
+                    '结论矛盾：%s 共 %d 次测量，合格/超差结论不一致' % (it['name'], len(rs)),
+                    iid, gating=True)
             if len(rs) > 1:
                 add('duplicate', 'dup:%s' % iid, 'warn',
                     '重复测量：%s 共 %d 次读数（以最近一次为准）' % (it['name'], len(rs)), iid)
-        item_states[iid] = state
+        item_states[iid] = st
 
-    # 3) 测点错序：后测的读数序号小于之前已测到的序号（跳回测）
+    # 2) 测点错序：按读数时间，后测读数的路线序号小于之前已到达序号
     measured_seq.sort(key=lambda t: t[1])
-    cursor = 0
-    out_of_order = set()
+    cursor, out_of_order = 0, set()
     for seq_v, _rid in measured_seq:
         if seq_v < cursor:
             out_of_order.add(seq_v)
         cursor = max(cursor, seq_v)
+    seq_to_item = {it['seq']: it for it in items}
     for seq_v in sorted(out_of_order):
-        it = next(i for i in items if i['seq'] == seq_v)
+        it = seq_to_item[seq_v]
         add('out_of_order', 'order:%s' % it['id'], 'manual',
-            '测点错序：%s（%s）在后续测点之后才测量，请按检验路线补测/核对' % (it['id'], it['name']),
+            '测点错序：%s（%s）在后续测点之后才测量，请按检验路线核对' % (it['id'], it['name']),
             it['id'])
 
-    # 4) 处置结论 → 异常结案；返工未重测合格时仍阻塞放行
-    disp_list = list(dispositions or [])
-    disp_by_key = {}
-    for d in disp_list:
-        disp_by_key.setdefault(d.get('akey'), []).append(d)
-
-    rework_open = set()   # 返工后尚未重测合格的测点
-    for it in items:
-        rs = by_item.get(it['id'], [])
-        latest = max(rs, key=lambda x: x.get('id') or 0) if rs else None
-        latest_id = latest.get('id') if latest else 0
-        ngs = [d for d in disp_by_key.get('ng:%s' % it['id'], [])]
-        if ngs:
-            last = ngs[-1]
-            if str(last.get('action')) == 'rework':
-                # 返工后需要一条晚于处置时间/ID 的合格读数
-                rework_ids = [x.get('id') or 0 for x in rs]
-                good_after = any(
-                    (x.get('id') or 0) > (last.get('id') or 0) and
-                    item_states[it['id']].get('status') == 'ok'
-                    for x in rs)
-                if not good_after:
-                    rework_open.add(it['id'])
-                    add('rework_pending', 'rework:%s' % it['id'], 'error',
-                        '返工待重测：%s 已登记返工，须重新测量合格后方可放行' % it['name'], it['id'])
-
-    def is_resolved(a):
-        ds = disp_by_key.get(a['key'], [])
-        if not ds:
-            return False
-        if a['kind'] == 'rework_pending':
-            return False
-        # 返工结论在“返工待重测”消失前不算结案
-        if a['kind'] == 'out_of_tol':
-            last = ds[-1]
-            if str(last.get('action')) == 'rework' and a['item'] in rework_open:
-                return False
-        return True
+    # 3) 处置 → 结案。处置按测点（从 akey 解析 item）作用于该测点的全部异常；
+    #    返工后必须有“处置登记之后新增”的合格读数才结案，否则生成返工待重测。
+    disps_by_item = {}
+    for d in (dispositions or []):
+        iid = _item_of_key(d.get('akey'))
+        if iid:
+            disps_by_item.setdefault(iid, []).append(d)
 
     for a in anomalies:
-        a['resolved'] = is_resolved(a)
+        iid = a.get('item')
+        ds = disps_by_item.get(iid, [])
+        a['resolved'] = bool(ds) and _disposition_resolves(ds[-1], a, item_states.get(iid))
+
+    # 返工待重测（每个有返工结论但尚无后续合格读数的测点各一条）
+    rework_items = set()
+    for iid, ds in disps_by_item.items():
+        last = ds[-1]
+        if str(last.get('action')) == DISP_REWORK:
+            st = item_states.get(iid)
+            cutoff = last.get('meas_max_id', last.get('id', 0)) or 0
+            good_after = st and st['status'] == 'ok' and st['latest'] and \
+                (st['latest'].get('id') or 0) > cutoff
+            if not good_after:
+                rework_items.add(iid)
+    for iid in sorted(rework_items, key=lambda x: item_states[x]['seq']):
+        st = item_states[iid]
+        a = {'kind': 'rework_pending', 'key': 'rework:%s' % iid, 'level': 'error',
+             'msg': '返工待重测：%s 已登记返工，须新增合格读数后方可放行' % st['name'],
+             'item': iid, 'reading_id': None, 'resolved': False, 'gating': True}
+        anomalies.append(a)
 
     order_rank = {'error': 0, 'manual': 1, 'warn': 2}
     anomalies.sort(key=lambda a: (a['resolved'], order_rank.get(a['level'], 3),
                                   (a.get('item') or '')))
 
     required = [it for it in items if it.get('required', True)]
-    pending = [it['id'] for it in required if item_states[it['id']]['status'] == 'pending']
-    ng_items = [s['item'] for s in item_states.values()
-                if s['required'] and s['status'] in ('ng', 'bad')]
-    unresolved = [a for a in anomalies if not a['resolved']]
+    pending = [it['id'] for it in required
+               if item_states[it['id']]['status'] == 'pending']
+    unresolved_gating = [a for a in anomalies
+                         if not a['resolved'] and a.get('gating')]
 
-    # 放行阻塞项
-    blocking = []
-    for iid in pending:
-        blocking.append({'item': iid, 'reason': '必测项未测量'})
-    for a in unresolved:
-        if a['level'] == 'error':
-            blocking.append({'item': a.get('item'), 'reason': a['msg'], 'key': a['key']})
+    blocking = [{'item': iid, 'reason': '必测项未测量'} for iid in pending]
+    blocking += [{'item': a.get('item'), 'reason': a['msg'], 'key': a['key']}
+                 for a in unresolved_gating]
 
-    releasable = not blocking and not rework_open
+    releasable = not blocking
     next_item = _next_item(item_states, required)
-
     stats = {
         'items': len(items),
         'required': len(required),
@@ -572,7 +607,7 @@ def analyze(snapshot, readings, dispositions=None, released=False):
         'readings': len(active),
         'withdrawn': sum(1 for r in (readings or []) if r.get('withdrawn')),
         'anomalies': len(anomalies),
-        'unresolved': len(unresolved),
+        'unresolved': sum(1 for a in anomalies if not a['resolved']),
         'releasable': releasable,
         'released': bool(released),
     }
@@ -583,6 +618,32 @@ def analyze(snapshot, readings, dispositions=None, released=False):
         'next_item': next_item,
         'stats': stats,
     }
+
+
+def _item_of_key(akey):
+    """从异常 key 解析测点 id：ng:M003 / conflict:M003 / missing:M003 /
+    badvalue:M003:5 / unit:M003:5 / order:M003 / rework:M003。"""
+    if not akey:
+        return None
+    m = re.search(r'[MC]\d+', str(akey))
+    return m.group(0) if m else None
+
+
+def _disposition_resolves(disp, anomaly, st):
+    """单条处置是否结案该测点的某类异常。"""
+    action = str(disp.get('action'))
+    kind = anomaly['kind']
+    if kind == 'rework_pending':
+        return False
+    if action in (DISP_CONCESSION, DISP_SCRAP):
+        return True
+    if action == DISP_REWORK:
+        # 返工：只有后续新增合格读数才算真正结案
+        if st is None or st['status'] != 'ok' or not st.get('latest'):
+            return False
+        cutoff = disp.get('meas_max_id', disp.get('id', 0)) or 0
+        return (st['latest'].get('id') or 0) > cutoff
+    return False
 
 
 def _item_axis_ok(it):

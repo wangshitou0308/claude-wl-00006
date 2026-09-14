@@ -226,3 +226,57 @@ tr.warnrow td { background: #fff8e1; }
 #nbName { width: 240px; }
 #csvText { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 #qcTab-archive .chk { display: block; margin: 3px 0; }
+
+/* ---------- 首件尺寸检验页 ---------- */
+.qc-status.measuring { background: #f9a825; color: #212121; }
+.qc-status.review { background: #1565c0; }
+.qc-status.released { background: #2e7d32; }
+.qc-status.preparing { background: #546e7a; }
+#staleBanner { background: #fff3e0; border: 1px solid #ef6c00; color: #bf360c;
+  border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; font-size: 12px; }
+#releasedBanner { background: #e8f5e9; border: 1px solid #2e7d32; color: #1b5e20;
+  border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; font-size: 12px; }
+.fai-board-wrap { background: #fff; border: 1px solid #b0bec5; border-radius: 6px;
+  position: relative; margin-bottom: 10px; }
+.fai-board-toolbar { position: absolute; top: 6px; left: 6px; z-index: 5;
+  background: #fffffff0; border: 1px solid #cfd8dc; border-radius: 5px; padding: 3px 6px;
+  display: flex; align-items: center; gap: 4px; }
+#faiSvg { width: 100%; height: 46vh; min-height: 320px; display: block; background: #fafafa; cursor: default; }
+#faiSvg.picking { cursor: crosshair; }
+#faiSvg .fai-node { cursor: pointer; }
+#faiSvg .fai-node:hover .fai-hit { stroke: #1565c0; stroke-width: 1.4; }
+#faiSvg .fai-node.sel .fai-hit { stroke: #c62828; stroke-width: 2; }
+#faiSvg .fai-node.active .fai-hit { stroke: #2e7d32; stroke-width: 2.2; }
+#faiSvg text { font-family: inherit; user-select: none; }
+.meas-line { stroke: #1565c0; stroke-width: 0.7; stroke-dasharray: 4 2; }
+.meas-line.ok { stroke: #2e7d32; }
+.meas-line.ng { stroke: #c62828; }
+.meas-line.active { stroke: #ef6c00; stroke-width: 1.4; stroke-dasharray: none; }
+.meas-tag { font-size: 5px; fill: #1565c0; paint-order: stroke; stroke: #fff; stroke-width: 1.4; }
+.fai-pick-a { fill: rgba(198,40,40,.10); }
+.route-item { border: 1px solid #cfd8dc; border-left-width: 3px; border-radius: 5px;
+  background: #fff; padding: 5px 8px; margin: 4px 0; font-size: 12px; cursor: pointer; }
+.route-item:hover { background: #eef4fb; }
+.route-item.active { border-color: #ef6c00; background: #fff8e1; }
+.route-item.ok { border-left-color: #2e7d32; }
+.route-item.ng { border-left-color: #c62828; background: #ffebee; }
+.route-item.bad { border-left-color: #6a1b9a; background: #f3e5f5; }
+.route-item.pending { border-left-color: #90a4ae; }
+.route-item.opt { opacity: .85; }
+.route-item .rname { font-weight: 700; }
+.route-item .rmeta { color: #555; font-size: 11px; display: flex; justify-content: space-between; gap: 6px; }
+.route-item .rdev { font-weight: 700; }
+.route-item .rdev.ok { color: #2e7d32; }
+.route-item .rdev.ng { color: #c62828; }
+.route-item .rkind { color: #78909c; }
+.fai-progbar { height: 6px; background: #e0e0e0; border-radius: 3px; overflow: hidden; margin: 4px 0; }
+.fai-progbar > i { display: block; height: 100%; background: #2e7d32; }
+.st-chk { color: #2e7d32; font-weight: 700; }
+.st-ng { color: #c62828; font-weight: 700; }
+.st-bad { color: #6a1b9a; font-weight: 700; }
+.st-pend { color: #90a4ae; }
+@media print {
+  #topbar, #statusbar, #qcLeft, #qcRight, #qcCenter fieldset, .fai-board-toolbar { display: none !important; }
+  #qcMain { display: block; }
+  #qcCenter { overflow: visible; background: #fff; }
+}
