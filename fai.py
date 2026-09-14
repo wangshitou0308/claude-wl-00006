@@ -325,12 +325,16 @@ def build_snapshot(design, design_id=None, design_name=None, tol=None):
 
 
 def geometry_hash(snapshot):
-    """只对冻结的几何（连接器/分支/拼接/导线路径/包覆边界）取指纹。
-    自选测点与公差调整不影响几何，因此不会误报快照过期。"""
+    """只对冻结的几何与关键工艺尺寸取指纹。
+    连接器/分支/拼接的位置与姿态、拼接件类型/孔位/剥线/保护套长度、导线路径、
+    包覆边界参与；自选测点与公差调整不参与，故不会误报快照过期。"""
     payload = {
         'connectors': [[c['id'], round(c['x'], 2), round(c['y'], 2)] for c in snapshot['connectors']],
         'branches': [[b['id'], round(b['x'], 2), round(b['y'], 2)] for b in snapshot['branches']],
-        'splices': [[s['id'], round(s['x'], 2), round(s['y'], 2)] for s in snapshot['splices']],
+        'splices': [[s['id'], round(s['x'], 2), round(s['y'], 2),
+                     s.get('kind'), s.get('ports'), s.get('strip'),
+                     s.get('sleeve_d'), s.get('sleeve_len')]
+                    for s in snapshot['splices']],
         'wires': [[w['id'], w['from_node'], w['to_node'],
                    [[round(p['x'], 1), round(p['y'], 1)] for p in w['path']]]
                   for w in snapshot['wires']],

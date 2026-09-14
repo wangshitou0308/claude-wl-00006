@@ -576,9 +576,9 @@ def fai_add_measurement(bid, body):
     if not it:
         return None, (400, '测点不存在：%s' % iid)
     raw = body.get('value')
-    unit = str(body.get('unit') or '').strip()[:8]
-    # 只做一次“原值→mm”换算；非数字拒绝，单位缺失/不明仍存档由分析层标记
-    parsed = fai.parse_value(raw, unit)
+    unit_in = str(body.get('unit') or '').strip()[:8]
+    # 只做一次“原值→mm”换算；非数字拒绝，单位缺失/不明仍按原始单位存档由分析层标记
+    parsed = fai.parse_value(raw, unit_in)
     if parsed['error'] == 'bad_value':
         return None, (400, '实测值必须是数字')
     operator = str(body.get('operator') or '').strip()[:50]
@@ -587,7 +587,7 @@ def fai_add_measurement(bid, body):
         cur = con.execute(
             'INSERT INTO fai_measurements(batch_id, item, value, unit, value_raw, operator, note,'
             ' withdrawn, created_at) VALUES(?,?,?,?,?,?,?,0,?)',
-            (bid, iid, parsed['value_mm'], parsed['unit'], parsed['raw'],
+            (bid, iid, parsed['value_mm'], unit_in, parsed['raw'],
              operator, note, now_iso()))
         mid = cur.lastrowid
         con.execute('UPDATE fai_batches SET updated_at=? WHERE id=?', (now_iso(), bid))

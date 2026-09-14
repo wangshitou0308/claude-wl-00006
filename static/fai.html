@@ -56,6 +56,16 @@
           <g id="layer-node"></g>
         </g>
       </svg>
+      <div id="pickBar" class="fai-pickbar hidden">
+        <b id="pickTitle">点选两个基准</b>
+        <span id="pickSel" class="hint">基准 A：（未选）　｜　基准 B：（未选）</span>
+        <label class="pick-custom-only">名称 <input id="pickName" type="text" placeholder="自选测点名称（可空）" style="width:130px"></label>
+        <label class="pick-custom-only">下偏差 <input id="pickNeg" type="number" value="5" min="0" step="0.5"> mm</label>
+        <label class="pick-custom-only">上偏差 <input id="pickPos" type="number" value="5" min="0" step="0.5"> mm</label>
+        <span style="flex:1"></span>
+        <button id="pickConfirm" disabled>确认</button>
+        <button id="pickCancel">取消</button>
+      </div>
     </div>
     <fieldset id="entryFields" class="hidden">
       <legend>实测录入 <span id="entryHint" class="hint"></span></legend>
@@ -71,6 +81,7 @@
         <label>实测值 <input id="entryValue" type="number" min="0" step="0.1" placeholder="数值"></label>
         <label>单位
           <select id="entryUnit">
+            <option value="">（未填）</option>
             <option value="mm" selected>mm</option>
             <option value="cm">cm</option>
             <option value="m">m</option>
@@ -121,24 +132,6 @@
     <div class="row btns">
       <button id="nbCreate">冻结并创建</button>
       <button id="nbCancel">取消</button>
-    </div>
-  </div>
-</div>
-
-<div id="pickModal" class="modal-mask hidden">
-  <div class="modal" style="width:440px">
-    <h4 id="pickTitle">点选两个基准</h4>
-    <p class="hint">在钉板图上依次点选两个基准（连接器/分支点/拼接件），系统量其直线理论尺寸。</p>
-    <div class="row"><label>名称 <input id="pickName" type="text" placeholder="自选测点名称（可空）"></label></div>
-    <div class="row">
-      <label>下偏差 <input id="pickNeg" type="number" value="5" min="0" step="0.5"> mm</label>
-      <label>上偏差 <input id="pickPos" type="number" value="5" min="0" step="0.5"> mm</label>
-    </div>
-    <div class="row" id="pickSel">基准 A：（未选）　｜　基准 B：（未选）</div>
-    <div class="row btns">
-      <button id="pickConfirm">确认</button>
-      <button id="pickMeasure">确认并去录入</button>
-      <button id="pickCancel">取消</button>
     </div>
   </div>
 </div>

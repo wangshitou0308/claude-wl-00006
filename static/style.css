@@ -242,6 +242,15 @@ tr.warnrow td { background: #fff8e1; }
   background: #fffffff0; border: 1px solid #cfd8dc; border-radius: 5px; padding: 3px 6px;
   display: flex; align-items: center; gap: 4px; }
 #faiSvg { width: 100%; height: 46vh; min-height: 320px; display: block; background: #fafafa; cursor: default; }
+.fai-pickbar {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+  z-index: 20; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #e3f2fd; border: 1px solid #1565c0; border-radius: 8px;
+  box-shadow: 0 4px 16px #0004; padding: 8px 12px; max-width: 94%; width: max-content;
+}
+.fai-pickbar b { color: #0d47a1; }
+.fai-pickbar label { display: inline-flex; align-items: center; gap: 3px; font-size: 12px; }
+.fai-pickbar .pick-custom-only.hidden { display: none; }
 #faiSvg.picking { cursor: crosshair; }
 #faiSvg .fai-node { cursor: pointer; }
 #faiSvg .fai-node:hover .fai-hit { stroke: #1565c0; stroke-width: 1.4; }

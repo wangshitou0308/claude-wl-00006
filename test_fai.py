@@ -200,6 +200,20 @@ ok(fai.geometry_hash(snap2) == g0, '追加自选测点几何指纹不变')
 D2 = json.loads(json.dumps(D))
 D2['nodes'][0]['x'] += 30
 ok(fai.current_hash(D2) != fai.current_hash(D), '方案移动连接器 → 指纹变化（标记过期）')
+
+print('== 拼接件工艺变化（类型/孔位/剥线/保护套）纳入过期 ==')
+def splice_mutated(**kw):
+    d = json.loads(json.dumps(D))
+    s = next(n for n in d['nodes'] if n['id'] == 's1')
+    s.update(kw)
+    return d
+base_h = fai.current_hash(D)
+ok(fai.current_hash(splice_mutated(kind='butt')) != base_h, '拼接件类型改变（cap→butt）→ 快照过期')
+ok(fai.current_hash(splice_mutated(ports=6)) != base_h, '孔位数改变 → 快照过期')
+ok(fai.current_hash(splice_mutated(strip=12)) != base_h, '剥线长度改变 → 快照过期')
+ok(fai.current_hash(splice_mutated(sleeveLen=30)) != base_h, '保护套长度改变 → 快照过期')
+ok(fai.current_hash(splice_mutated(sleeveD=8)) != base_h, '保护套外径改变 → 快照过期')
+
 # 几何不变仅重存 → 不过期
 ok(fai.current_hash(json.loads(json.dumps(D))) == fai.current_hash(D), '几何未变则快照不过期')
 
@@ -255,6 +269,17 @@ ok(abs(m10['value'] - 100) < 1e-6 and m10['value_raw'] == '10' and m10['unit'] =
 # 撤回该读数
 code, d = req('POST', '/api/fai/%s/withdraw' % bid, {'id': m10['id']})
 ok(code == 200, '撤回指定读数')
+
+# 空单位：入库保留空串，刷新后仍报“单位缺失”，不被改写成 mm
+code, d = req('POST', '/api/fai/%s/measurements' % bid,
+              {'item': any_item, 'value': 123, 'unit': ''})
+ok(code == 200 and '单位缺失' in (d.get('warning') or ''), '空单位录入返回单位缺失提示')
+code, det = req('GET', '/api/fai/%s' % bid)
+mu = [m for m in det['measurements'] if m['item'] == any_item and not m['withdrawn']][-1]
+ok(mu['unit'] == '' and abs(mu['value'] - 123) < 1e-9, '空单位原样存储（未被改写为 mm）')
+ok(any(a['kind'] == 'missing_unit' for a in det['analysis']['anomalies']),
+   '刷新后仍保留“单位缺失”异常')
+req('POST', '/api/fai/%s/withdraw' % bid, {'id': mu['id']})
 
 # 未知单位：读数存档但分析标 unknown_unit、不可放行
 code, d = req('POST', '/api/fai/%s/measurements' % bid, {'item': any_item, 'value': 5, 'unit': '英尺'})

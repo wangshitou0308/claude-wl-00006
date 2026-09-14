@@ -392,19 +392,21 @@ function openPick(mode) {
   const cur = state.current;
   if (mode === 'custom' && cur.batch.status !== 'preparing') return;
   state.pick = { a: null, b: null, mode };
-  $('pickTitle').textContent = mode === 'custom' ? '添加自选测点：点选两个基准' : '点选两个基准录入';
+  $('pickTitle').textContent = mode === 'custom' ? '添加自选测点：在图上依次点两个基准' : '点选两个基准定位测点';
   $('pickName').value = '';
-  // 名称/公差仅“添加自选测点”需要
-  $('pickName').parentElement.style.display = mode === 'custom' ? '' : 'none';
-  $('pickNeg').parentElement.style.display = mode === 'custom' ? '' : 'none';
-  $('pickConfirm').textContent = mode === 'custom' ? '加入测点' : '定位测点';
+  document.querySelectorAll('.pick-custom-only').forEach(el =>
+    el.classList.toggle('hidden', mode !== 'custom'));
+  $('pickConfirm').textContent = mode === 'custom' ? '加入测点' : '定位并录入';
   updatePickSel();
-  $('pickModal').classList.remove('hidden');
+  // 浮动条不遮挡钉板：节点照常接收点击
+  $('pickBar').classList.remove('hidden');
   $('faiSvg').classList.add('picking');
+  setStatus(mode === 'custom' ? '请在钉板上依次点选两个基准节点' : '请在钉板上点选两个基准节点');
 }
 function closePick() {
   state.pick = null;
-  $('pickModal').classList.add('hidden');
+  $('pickBar').classList.add('hidden');
+  $('faiSvg').classList.remove('picking');
   renderBoard();
 }
 function updatePickSel() {
@@ -413,15 +415,14 @@ function updatePickSel() {
   const p = state.pick;
   $('pickSel').textContent = `基准 A：${nm(p.a)}　｜　基准 B：${nm(p.b)}`;
   $('pickConfirm').disabled = !(p.a && p.b);
-  $('pickMeasure').disabled = !(p.a && p.b);
 }
 function onNodeClick(nid) {
   const p = state.pick;
   const cur = state.current;
   if (p) {
     if (!p.a) p.a = nid;
-    else if (!p.b) p.b = nid;
-    else { p.a = nid; p.b = null; }   // 重新开始
+    else if (!p.b) { if (p.a !== nid) p.b = nid; }   // 重复点同一节点忽略
+    else { p.a = nid; p.b = null; }                    // 已选满再点：开启新一轮
     updatePickSel();
     renderBoard();
     return;
@@ -435,20 +436,20 @@ function onNodeClick(nid) {
   if (target) selectItem(target.id, true);
 }
 
-async function confirmPick(andMeasure) {
+async function confirmPick() {
   const cur = state.current;
   const p = state.pick;
-  if (!p.a || !p.b) return;
+  if (!p || !p.a || !p.b) return;
   if (p.mode === 'custom') {
     try {
       const res = await post(`/api/fai/${cur.batch.id}/items`, {
         ref_a: p.a, ref_b: p.b, name: $('pickName').value,
         tol_neg: $('pickNeg').value, tol_pos: $('pickPos').value,
       });
-      setStatus('已添加自选测点 ' + res.item.id);
+      setStatus('已添加自选测点 ' + res.item.id + '，共 ' + cur.snapshot.items.length + ' → ' + (cur.snapshot.items.length + 1) + ' 项');
       closePick();
       await loadBatch(cur.batch.id);
-      selectItem(res.item.id, andMeasure);
+      selectItem(res.item.id, false);
     } catch (e) { alert(e.message); }
     return;
   }
@@ -709,7 +710,7 @@ function setupBoardNav() {
   }, { passive: false });
   let drag = null;
   svg.addEventListener('mousedown', e => {
-    if (e.target.closest('.fai-node') || e.target.classList.contains('meas-line') || state.pick) return;
+    if (e.target.closest && (e.target.closest('.fai-node') || e.target.classList?.contains('meas-line') || state.pick)) return;
     drag = { x: e.clientX, y: e.clientY, ox: state.view.ox || 0, oy: state.view.oy || 0 };
   });
   window.addEventListener('mousemove', e => {
@@ -767,9 +768,9 @@ $('batchSel').onchange = async e => {
   if (id) await loadBatch(id); else { state.current = null; renderAll(); }
 };
 $('pickCancel').onclick = closePick;
-$('pickConfirm').onclick = () => confirmPick(false);
-$('pickMeasure').onclick = () => confirmPick(true);
-$('pickModal').addEventListener('click', e => { if (e.target.id === 'pickModal') closePick(); });
+$('pickConfirm').onclick = () => confirmPick();
+$('pickBar').addEventListener('keydown', e => { if (e.key === 'Enter' && !$('pickConfirm').disabled) confirmPick(); });
+window.addEventListener('keydown', e => { if (e.key === 'Escape' && state.pick) closePick(); });
 $('newBatchModal').addEventListener('click', e => { if (e.target.id === 'newBatchModal') e.target.classList.add('hidden'); });
 
 (async function init() {
