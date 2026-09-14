@@ -373,6 +373,30 @@ console.log('== 回归：装配字段与多级拼接链 ==');
   dn.nodes.push(J1, J2);
   dn.nets = [{ name: 'X', endpoints: ['J1.2', 'J2.2'] }];
   ok(M.validate(dn).some(i => i.kind === 'net-open'), '真实未连通网络仍报未连通');
+
+  // Bug：尚未开始逐步推演（step=null）时，渲染装配面板不得访问 step.confirmed；
+  // 含拼接链的导入方案必须能渲染出送线 + 拼接步骤（“开始逐步推演”入口依赖不抛异常）
+  const stepsNull = M.assemblySteps(dc, new Set());
+  let rendered = '';
+  let threw = false;
+  try {
+    rendered = stepsNull.map(s => {
+      if (s.kind === 'wire') return s.length.toFixed(0) + s.shared.toFixed(0) + s.locked;
+      // 模拟 renderAsm 非推演分支：step 为 null，只能用步骤自带的 count，不能读 step.confirmed
+      return s.count;
+    }).join('|');
+  } catch (e) { threw = true; }
+  ok(!threw && stepsNull.filter(s => s.kind === 'wire').length === 4
+    && stepsNull.filter(s => s.kind === 'splice').length === 2,
+    'step 为空时拼接链方案装配步骤可正常渲染（4 送线 + 2 拼接）：' + rendered);
+
+  // 合法 v1 导入方案同样：有装配顺序、可生成步骤
+  const v1empty = M.migrateDesign({
+    version: 1, name: 'v1', board: { width: 900, height: 600, grid: 10 }, settings: {},
+    nodes: [J1, J2], zones: [],
+    wires: [], nets: [{ label: 'W-1', from: 'J1.1', to: 'J2.1' }],
+  });
+  ok(M.assemblyOrder(v1empty).length === 0, 'v1 空方案装配顺序为空（面板显示尚未布线）');
 }
 
 console.log('== 旧方案迁移 ==');

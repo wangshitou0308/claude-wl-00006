@@ -119,6 +119,9 @@ function refreshAll() {
 function afterLoad() {
   state.sel = { kind: null, id: null };
   state.drawing = null;
+  state.step = null;       // 导入/载入新方案时退出任何逐步推演状态
+  state.epDrag = null;
+  $('stepBar').classList.add('hidden');
   hidePinPicker();
   syncDataPanel();
   refreshAll();
@@ -998,12 +1001,20 @@ function renderAsm() {
         <span style="color:#999;font-size:11px">主干 ${s.shared.toFixed(0)}mm</span>`;
     } else {
       const kd = M.spliceKind(s.splice.kind);
-      const live = s.attaches.filter(a => st.confirmed.has(a.wire.id)).length;
-      const ready = s.count >= 2 && live === s.count;
+      let statusH;
+      if (st && st.active) {
+        // 推演中：实时统计已就位导线数
+        const live = s.attaches.filter(a => st.confirmed.has(a.wire.id)).length;
+        const ready = s.count >= 2 && live === s.count;
+        statusH = `<span style="color:#${ready ? '2e7d32' : 'c62828'};font-size:11px">${live}/${s.count} 线就位</span>`;
+      } else {
+        // 尚未开始推演：只显示待接线数，不访问可能为 null 的 step
+        statusH = `<span style="color:#888;font-size:11px">${s.count} 线待接</span>`;
+      }
       body = `<span class="no">${i + 1}</span>
         <span class="splicetag">${kd.short}</span>
         <span class="asmname">${esc(s.label)}（集线→压接→套管）</span>
-        <span style="color:#${ready ? '2e7d32' : 'c62828'};font-size:11px">${live}/${s.count} 线就位</span>`;
+        ${statusH}`;
     }
     const dataAttr = s.kind === 'wire' ? `data-w="${s.wireId}"` : `data-sp="${s.spliceId}"`;
     return `<div class="asmitem ${cls}" ${dataAttr}>${body}</div>`;
